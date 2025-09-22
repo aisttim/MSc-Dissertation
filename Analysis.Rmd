@@ -1,33 +1,33 @@
 ---
 title: "Analysis"
-output: html_document
+output: html_document 
 ---
 
 Clear global environment 
 ```{r}
-rm(list=ls())
+# rm(list=ls())
 ```
 
 Packages 
 ```{r}
 options(stringsAsFactors = FALSE)
 suppressPackageStartupMessages({
-  library(dplyr)               # data manipulation
-  library(tidyr)               # reshaping and missing handling
-  library(purrr)               # functional helpers
-  library(tibble)              # tidy tables
-  library(stringr)             # string utilities
-  library(readr)               # fast csv io
-  library(sf)                  # vector geodata
-  library(spdep)               # spatial dependence tools
-  library(Matrix)              # sparse matrices
-  library(AER)                 # poisson dispersion test
-  library(spaMM)               # poisson–car car ml fits
-  library(car)                 # vif for multicollinearity
-  library(mgcv)                # gam diagnostics
-  library(gt)                  # html tables
-  library(openxlsx)            # excel output
-  library(ggplot2)             # plotting
+  library(dplyr)               
+  library(tidyr)               
+  library(purrr)               
+  library(tibble)              
+  library(stringr)             
+  library(readr)               
+  library(sf)                  
+  library(spdep)               
+  library(Matrix)              
+  library(AER)                 
+  library(spaMM)               
+  library(car)                 
+  library(mgcv)                
+  library(gt)                  
+  library(openxlsx)            
+  library(ggplot2)             
 })
 
 ```

@@ -2,6 +2,7 @@
 title: "Predictors Operationalisation"
 output: html_document
 ---
+
 Clear global environment  
 ```{r}
 rm(list=ls())
@@ -10,21 +11,21 @@ rm(list=ls())
 Packages
 ```{r}
 # load all packages
-library(tidyverse)       # dplyr, tidyr, readr, purrr, ggplot2, stringr, tibble
-library(sf)              # vector geospatial data
-library(terra)           # raster data
-library(exactextractr)   # area-weighted raster extraction
-library(units)           # unit handling
-library(psych)           # kmo, bartlett, describe
-library(Hmisc)           # rcorr
-library(PerformanceAnalytics) # correlation charts
-library(ggcorrplot)      # correlation heatmaps with p-values
-library(janitor)         # clean_names
-library(GPArotation)     # rotations for factor/pca tooling
-library(factoextra)      # pca visualisation
-library(naniar)          # missingness summaries
-library(tools)           # filename utilities
-library(sjmisc)          # kept for compatibility where referenced
+library(tidyverse)       
+library(sf)              
+library(terra)           
+library(exactextractr)   
+library(units)           
+library(psych)           
+library(Hmisc)           
+library(PerformanceAnalytics) 
+library(ggcorrplot)      
+library(janitor)         
+library(GPArotation)     
+library(factoextra)      
+library(naniar)          
+library(tools)           
+library(sjmisc)          
 ```
 
 Folder for saved data  
@@ -122,7 +123,7 @@ Ordnance Survey Points of Interest were obtained via EDINA Digimap under an inst
 Nonzero cases diagnostics
 ```{r}
 # load poi densities data
-poi_data <- readr::read_csv("POI_LSOA_Density.csv")
+poi_data <- readr::read_csv("data/POI_LSOA_Density.csv")
 
 # create raw and log subsets for diagnostics
 log_density <- poi_data %>%
@@ -215,7 +216,7 @@ SPACE SYNTAX
 Clean space syntax measures
 ```{r}
 # import raw space syntax segment file
-angular_segment_gl <- readr::read_csv("ANGULAR_segment_GL.csv")
+angular_segment_gl <- readr::read_csv("data/ANGULAR_segment_GL.csv")
 
 # find integration columns and set -1 to missing
 integration_cols <- grep("Integration", names(angular_segment_gl), value = TRUE)
@@ -269,7 +270,7 @@ readr::write_csv(angular_segment_gl_clean, file.path(SAVED_DIR, "ANGULAR_segment
 Segment-level space syntax measures aggregation to LSOAs
 ```{r}
 # read segments and lsoa polygons
-segments <- st_read("ANGULAR_measures_LINES_geometry/ANGULAR_measures_LINES_geometry.shp")
+segments <- st_read("data/ANGULAR_measures_LINES_geometry/ANGULAR_measures_LINES_geometry.shp")
 lsoas <- st_read("Greater_London _LSOAs/Greater_London _LSOAs.shp")
 
 # ensure British National Grid (epsg:27700) is used for accurate lengths
@@ -382,7 +383,7 @@ SOCIODEMOGRAPHICS
 Census data prep
 ```{r}
 # list census raw files to reshape
-data_dir <- "census data/"
+data_dir <- "data/census data/"
 raw_files <- list.files(path = data_dir, pattern = "_RAW\\.csv$", full.names = TRUE)
 
 # helper to reshape a single file into wide indicator form
@@ -427,12 +428,12 @@ cat("cols:", ncol(final_df) - 1, "\n")
 Join population and deprivation (IMD) data
 ```{r}
 # paths to population and imd raw files
-raw_dir <- "census data/population and IMD data/"
+raw_dir <- "data/census data/population and IMD data/"
 raw_files <- list.files(path = raw_dir, pattern = "_RAW\\.csv$", full.names = TRUE)
 
 # cleaned master with stable lsoa code column
 cleaned <- readr::read_csv(
-  "Census_LSOA_CLEANED.csv",
+  "data/Census_LSOA_CLEANED.csv",
   col_types = cols(`Lower layer Super Output Areas Code` = col_character())
 )
 
@@ -660,7 +661,7 @@ Land Use
 Aggregate land use categories to LSOA
 ```{r}
 # import land use attributes
-land_data_raw <- readr::read_csv("LandUse_LSOA_gl.csv")
+land_data_raw <- readr::read_csv("data/LandUse_LSOA_gl.csv")
 
 # clean names
 land_data <- land_data_raw %>% janitor::clean_names()
@@ -729,7 +730,7 @@ LandScan - Ambient Population
 Ambient population density per lsoa
 ```{r}
 # load landscan raster
-landscan <- terra::rast("landscan-global-2023.tif")
+landscan <- terra::rast("data/landscan-global-2023.tif")
 
 # load lsoa boundaries and project as needed
 lsoa_boundaries <- st_read("Greater_London _LSOAs") %>% st_transform(27700)
@@ -780,15 +781,15 @@ All prepared datasets plus dependent variables datasets are combined into a sing
 ```{r}
 # define file paths for all inputs to combine
 files <- list(
-  TOV = "OF_LSOA_greater_london_22_24.csv",
-  TFV = "FROM_LSOA_greater_london_22_24.csv",
+  TOV = "data/OF_LSOA_greater_london_22_24.csv",
+  TFV = "data/FROM_LSOA_greater_london_22_24.csv",
   demographics_short = "saved data/demographics_LSOA_SHORT.csv",
   mixed_land_use     = "saved data/land_use_with_mixed_index.csv",
   ambient_pop        = "saved data/lsoa_ambient_population.csv",
   syntax_measures    = "saved data/lsoa_space_syntax_measures.csv",
-  res_pop_dens       = "resident_pop_density_RAW.csv",
-  work_pop_dens      = "workday_pop_density_RAW.csv",
-  POI                = "POI_LSOA_Density.csv"  # "saved data/POI_LSOA_Density.csv" if used code above to aggregate to LSOAs from point data
+  res_pop_dens       = "data/resident_pop_density_RAW.csv",
+  work_pop_dens      = "data/workday_pop_density_RAW.csv",
+  POI                = "data/POI_LSOA_Density.csv"  # "saved data/POI_LSOA_Density.csv" if used code above to aggregate to LSOAs from point data
 )  
 
 # read each dataset with explicit column types for keys
