@@ -1,0 +1,834 @@
+---
+title: "Predictors Operationalisation"
+output: html_document
+---
+Clear global environment  
+```{r}
+rm(list=ls())
+```
+
+Packages
+```{r}
+# load all packages
+library(tidyverse)       # dplyr, tidyr, readr, purrr, ggplot2, stringr, tibble
+library(sf)              # vector geospatial data
+library(terra)           # raster data
+library(exactextractr)   # area-weighted raster extraction
+library(units)           # unit handling
+library(psych)           # kmo, bartlett, describe
+library(Hmisc)           # rcorr
+library(PerformanceAnalytics) # correlation charts
+library(ggcorrplot)      # correlation heatmaps with p-values
+library(janitor)         # clean_names
+library(GPArotation)     # rotations for factor/pca tooling
+library(factoextra)      # pca visualisation
+library(naniar)          # missingness summaries
+library(tools)           # filename utilities
+library(sjmisc)          # kept for compatibility where referenced
+```
+
+Folder for saved data  
+```{r}
+# create a folder for outputs 
+SAVED_DIR <- "saved data"
+dir.create(SAVED_DIR, showWarnings = FALSE)
+
+```
+
+------------------------------------------------------------------------------------------------------------------------------------
+POI
+------------------------------------------------------------------------------------------------------------------------------------
+Ordnance Survey Points of Interest were obtained via EDINA Digimap under an institutional licence; the raw POI file cannot be redistributed. Users with valid access can obtain the dataset from Digimap, uncomment, place it in and then run to generate the derived inputs:
+```{r}
+# # load raw poi data
+# poi_data_raw <- readr::read_csv("POI_GL.csv")
+# 
+# # regroup categories for analysis
+# poi_cleaned <- poi_data_raw %>%
+#   mutate(Final_Category = case_when(
+#     groupname == "Retail" & classname %in% c(
+#       "Shopping Centres and Retail Parks", "Department Stores", "Supermarket Chains",
+#       "DIY and Home Improvement", "Discount Stores"
+#     ) ~ "major_retail_hubs",
+#     groupname == "Retail" & classname %in% c("Alcoholic Drinks Including Off Licences and Wholesalers") ~ "off_premise_alcohol_outlets",
+#     categoryna %in% "Accommodation" & !(classname %in% c("Hostels and Refuges For The Homeless", "Timeshare", "Youth Accommodation")) ~ "accommodation",
+#     categoryna %in% "Recreational" & !(classname %in% c("Commons")) ~ "recreational",
+#     categoryna %in% "Eating and Drinking" ~ "eating_drinking",
+#     groupname == "Primary, Secondary and Tertiary Education" | categoryna == "Primary, Secondary and Tertiary Education" ~ "education",
+#     groupname == "Public Transport, Stations and Infrastructure" | categoryna == "Public Transport, Stations and Infrastructure" ~ "transport_stations",
+#     categoryna == "Road and Rail" & classname %in% c("Parking") ~ "parking",
+#     categoryna == "Gambling" & !(classname %in% c("Amusement Parks and Arcades")) ~ "adult_entertainment",
+#     categoryna == "Venues, Stage and Screen" & classname %in% c("Adult Venues", "Nightclubs") ~ "adult_entertainment",
+#     categoryna == "Sports Complex" ~ "sports_other_entertainment",
+#     categoryna == "Gambling" & (classname %in% c("Amusement Parks and Arcades")) ~ "sports_other_entertainment",
+#     categoryna == "Venues, Stage and Screen" & !(classname %in% c("Adult Venues", "Nightclubs")) ~ "sports_other_entertainment",
+#     TRUE ~ NA_character_
+#   )) %>%
+#   filter(!is.na(Final_Category))
+# 
+# #Aggregate to LSOAs
+# # read lsoa boundaries
+# lsoa_boundaries <- st_read("Greater_London _LSOAs")
+# 
+# # convert poi to sf with bng coordinates and match lsoa crs
+# poi_sf <- poi_cleaned %>%
+#   st_as_sf(coords = c("feature_ea", "feature_no"), crs = 27700) %>%
+#   st_transform(st_crs(lsoa_boundaries))
+# 
+# # assign poi to containing lsoas
+# poi_lsoa <- st_join(poi_sf, lsoa_boundaries, left = FALSE) %>%
+#   st_drop_geometry()
+# 
+# # aggregate counts per lsoa and category then pivot wide
+# lsoa_poi_counts <- poi_lsoa %>%
+#   group_by(lsoa21cd, Final_Category) %>%
+#   summarise(POI_Count = n(), .groups = "drop")
+# lsoa_poi_wide <- lsoa_poi_counts %>%
+#   pivot_wider(names_from = Final_Category, values_from = POI_Count, values_fill = 0)
+# 
+# # join counts back to lsoa polygons
+# lsoa_final <- lsoa_boundaries %>% left_join(lsoa_poi_wide, by = "lsoa21cd")
+# 
+# # Densities: 
+# 
+# # compute area in km^2 and densities per km^2 for each numeric poi column
+# lsoa_final_density <- lsoa_final
+# lsoa_final_density$Area_km2 <- as.numeric(st_area(lsoa_final_density)) / 1e6
+# 
+# poi_columns <- names(lsoa_final_density)[
+#   sapply(lsoa_final_density, is.numeric) & !(names(lsoa_final_density) %in% c("Area_km2"))
+# ]
+# 
+# for (col in poi_columns) {
+#   density_col <- paste0(col, "_density_per_km2")
+#   lsoa_final_density[[density_col]] <- lsoa_final_density[[col]] / lsoa_final_density$Area_km2
+# }
+# 
+# # drop geometry for modelling
+# poi_data <- st_drop_geometry(lsoa_final_density)
+# 
+# # Log densities:
+# # add log densities using log1p() which is natural log of (1 + x)
+# poi_data <- poi_data %>%
+#   mutate(across(ends_with("_density_per_km2"), ~ log1p(.), .names = "log_{.col}"))
+
+```
+```{r}
+
+#readr::write_csv(poi_data, file.path(SAVED_DIR, "POI_LSOA_Density.csv"))
+
+```
+
+Nonzero cases diagnostics
+```{r}
+# load poi densities data
+poi_data <- readr::read_csv("POI_LSOA_Density.csv")
+
+# create raw and log subsets for diagnostics
+log_density <- poi_data %>%
+  dplyr::select(starts_with("log_") & ends_with("_density_per_km2"))
+raw_density <- poi_data %>%
+  dplyr::select(ends_with("_density_per_km2") & !starts_with("log_"))
+
+# completeness diagnostics
+bind_rows(
+  raw_density %>% summarise(total_rows = n(), complete_cases = sum(complete.cases(.)), pct_complete = complete_cases / total_rows * 100) %>% mutate(dataset = "raw_density"),
+  log_density %>% summarise(total_rows = n(), complete_cases = sum(complete.cases(.)), pct_complete = complete_cases / total_rows * 100) %>% mutate(dataset = "log_density")
+) %>% select(dataset, everything())
+
+# prevalence and variation among nonzero densities
+nonzero_summary <- raw_density %>%
+  summarise(across(
+    where(is.numeric),
+    list(
+      count = ~ sum(. != 0, na.rm = TRUE),
+      pct   = ~ mean(. != 0, na.rm = TRUE) * 100
+    ),
+    .names = "{.col}_{.fn}"
+  )) %>%
+  pivot_longer(cols = everything(), names_to = c("variable", "metric"), names_pattern = "(.*)_(count|pct)$", values_to = "value") %>%
+  pivot_wider(names_from = metric, values_from = value) %>%
+  mutate(variable = str_remove(variable, "_density_per_km2$"))
+
+variation_summary <- raw_density %>%
+  select(where(is.numeric)) %>%
+  summarise(across(
+    everything(),
+    list(
+      nonzero_n   = ~ sum(. > 0, na.rm = TRUE),
+      nonzero_pct = ~ mean(. > 0, na.rm = TRUE) * 100,
+      median_pos  = ~ median(.[. > 0], na.rm = TRUE),
+      iqr_pos     = ~ IQR(.[. > 0], na.rm = TRUE),
+      cv_pos      = ~ sd(.[. > 0], na.rm = TRUE) / mean(.[. > 0], na.rm = TRUE)
+    ),
+    .names = "{.col}_{.fn}"
+  )) %>%
+  pivot_longer(cols = everything(), names_to = c("variable", "metric"),
+               names_pattern = "(.*)_(nonzero_n|nonzero_pct|median_pos|iqr_pos|cv_pos)$", values_to = "value") %>%
+  pivot_wider(names_from = metric, values_from = value)
+
+```
+
+Correlations/plots 
+```{r}
+# pairwise correlations among raw densities using pearson and spearman
+raw_vars <- raw_density %>% select(where(is.numeric))
+pairs <- combn(names(raw_vars), 2, simplify = FALSE)
+corr_df <- purrr::map_dfr(pairs, function(vars) {
+  x <- raw_vars[[vars[1]]]; y <- raw_vars[[vars[2]]]
+  tibble(
+    var1 = vars[1],
+    var2 = vars[2],
+    pearson  = cor(x, y, use = "pairwise.complete.obs", method = "pearson"),
+    spearman = cor(x, y, use = "pairwise.complete.obs", method = "spearman")
+  )
+})
+high_corr <- corr_df %>% filter(abs(pearson) > 0.5 | abs(spearman) > 0.5) %>%
+  arrange(desc(abs(pearson)), desc(abs(spearman)))
+print(high_corr)
+
+# histograms for raw and log densities
+raw_density %>%
+  select(where(is.numeric)) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, color = "white") +
+  facet_wrap(~ variable, scales = "free") +
+  labs(x = "raw density per km^2", y = "count", title = "distributions of raw poi densities") +
+  theme_minimal()
+
+log_density %>%
+  select(where(is.numeric)) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, color = "white") +
+  facet_wrap(~ variable, scales = "free") +
+  labs(x = "log1p density", y = "count", title = "distributions of log-transformed poi densities") +
+  theme_minimal()
+
+```
+
+
+------------------------------------------------------------------------------------------------------------------------------------
+SPACE SYNTAX 
+------------------------------------------------------------------------------------------------------------------------------------
+Clean space syntax measures
+```{r}
+# import raw space syntax segment file
+angular_segment_gl <- readr::read_csv("ANGULAR_segment_GL.csv")
+
+# find integration columns and set -1 to missing
+integration_cols <- grep("Integration", names(angular_segment_gl), value = TRUE)
+angular_segment_gl[integration_cols] <- lapply(
+  angular_segment_gl[integration_cols],
+  function(col) ifelse(col == -1, NA, col)
+)
+
+# find choice columns and add natural log of (value + 1)
+choice_cols <- grep("Choice", names(angular_segment_gl), value = TRUE)
+for (col in choice_cols) {
+  # log() here is natural log base e; +1 handles zeros
+  angular_segment_gl[[paste0(col, " log")]] <- log(angular_segment_gl[[col]] + 1)
+}
+
+# simplify and standardise column names for consistency
+names(angular_segment_gl) <- names(angular_segment_gl) %>%
+  str_replace("^T1024\\s+", "") %>%        # drop t1024 prefix tokens
+  str_replace_all("Choice", "ch") %>%      # shorten choice to ch
+  str_replace_all("Integration", "int") %>%# shorten integration to int
+  str_replace_all("metric", "") %>%        # drop suffix metric
+  str_replace_all("R10000", "10k") %>%
+  str_replace_all("R5000", "5k") %>%
+  str_replace_all("R2000", "2k") %>%
+  str_replace_all("R1000", "1k") %>%
+  str_replace_all("R500", "500m")
+
+# lower case and make names machine-safe with underscores
+names(angular_segment_gl) <- names(angular_segment_gl) %>%
+  tolower() %>%
+  str_replace_all("\\s+", "_") %>%
+  str_replace_all("_+$", "")
+
+# keep only identifiers, geometry coordinates, and measures needed later
+angular_segment_gl_clean <- angular_segment_gl %>%
+  select(
+    ref,
+    x1, x2, y1, y2,
+    segment_length,
+    connectivity,
+    angular_connectivity,
+    contains("ch"),
+    contains("int")
+  )
+
+# save cleaned segment measures for mapping 
+readr::write_csv(angular_segment_gl_clean, file.path(SAVED_DIR, "ANGULAR_segment_GL_cleaned.csv"))
+
+```
+
+Segment-level space syntax measures aggregation to LSOAs
+```{r}
+# read segments and lsoa polygons
+segments <- st_read("ANGULAR_measures_LINES_geometry/ANGULAR_measures_LINES_geometry.shp")
+lsoas <- st_read("Greater_London _LSOAs/Greater_London _LSOAs.shp")
+
+# ensure British National Grid (epsg:27700) is used for accurate lengths
+st_crs(segments) <- 27700
+segments <- st_transform(segments, 27700)
+lsoas <- st_transform(lsoas, 27700)
+```
+```{r}
+# split segments by lsoa polygons
+segments_split <- st_intersection(segments, lsoas)
+
+# compute length of each split piece in projection units (meters)
+segments_split <- segments_split %>%
+  mutate(seg_length = as.numeric(st_length(geometry)))
+```
+```{r}
+# aggregate to lsoa using length-weighted means 
+lsoa_summary_raw <- segments_split %>%
+  group_by(lsoa21cd) %>%
+  summarise(
+    wmean_ch = weighted.mean(ch, seg_length, na.rm = TRUE),
+    wmean_ch_500m = weighted.mean(ch_500m, seg_length, na.rm = TRUE),
+    wmean_ch_1k = weighted.mean(ch_1k, seg_length, na.rm = TRUE),
+    wmean_ch_2k = weighted.mean(ch_2k, seg_length, na.rm = TRUE),
+    wmean_ch_5k = weighted.mean(ch_5k, seg_length, na.rm = TRUE),
+    wmean_ch_10k = weighted.mean(ch_10k, seg_length, na.rm = TRUE),
+
+    wmean_ch_log = weighted.mean(ch_log, seg_length, na.rm = TRUE),
+    wmean_ch_500m_lo = weighted.mean(ch_500m_lo, seg_length, na.rm = TRUE),
+    wmean_ch_1k_log = weighted.mean(ch_1k_log, seg_length, na.rm = TRUE),
+    wmean_ch_2k_log = weighted.mean(ch_2k_log, seg_length, na.rm = TRUE),
+    wmean_ch_5k_log = weighted.mean(ch_5k_log, seg_length, na.rm = TRUE),
+    wmean_ch_10k_log = weighted.mean(ch_10k_log, seg_length, na.rm = TRUE),
+
+    wmean_int = weighted.mean(int, seg_length, na.rm = TRUE),
+    wmean_int_500m = weighted.mean(int_500m, seg_length, na.rm = TRUE),
+    wmean_int_1k = weighted.mean(int_1k, seg_length, na.rm = TRUE),
+    wmean_int_2k = weighted.mean(int_2k, seg_length, na.rm = TRUE),
+    wmean_int_5k = weighted.mean(int_5k, seg_length, na.rm = TRUE),
+    wmean_int_10k = weighted.mean(int_10k, seg_length, na.rm = TRUE),
+
+    mean_connectivity = mean(connectivi, na.rm = TRUE),
+    mean_angular_co = mean(angular_co, na.rm = TRUE),
+
+    wmean_connectivity = weighted.mean(connectivi, seg_length, na.rm = TRUE),
+    wmean_angular_co = weighted.mean(angular_co, seg_length, na.rm = TRUE),
+
+    total_segment_length = sum(seg_length, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# move the summaries into the polygon table then keep both spatial and raw versions
+lsoa_summary <- lsoas %>%
+  left_join(st_drop_geometry(lsoa_summary_raw), by = "lsoa21cd")
+
+# save 
+lsoa_summary %>%
+  st_drop_geometry() %>%
+  readr::write_csv(file.path(SAVED_DIR, "lsoa_space_syntax_measures.csv"))
+
+
+```
+
+Summary statistics/correlations/plots
+```{r}
+# prepare a wide data frame without geometry
+space_syntax <- lsoa_summary
+ss_data_df <- space_syntax %>% st_drop_geometry()
+
+# numeric columns only
+ss_numeric <- ss_data_df %>% select(where(is.numeric))
+
+# tabular summaries for quick inspection
+summary_stats <- psych::describe(ss_numeric)
+
+# histogram panel for all numeric measures
+ss_long <- ss_numeric %>%
+  pivot_longer(cols = everything(), names_to = "measure", values_to = "value")
+
+ggplot(ss_long, aes(x = value)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  facet_wrap(~ measure, scales = "free") +
+  theme_minimal() +
+  labs(title = "histograms of space syntax measures", x = "value", y = "count")
+
+# correlation heatmap of log choice and integration variables
+log_choice_vars <- ss_data_df %>% select(matches("^wmean_ch_.*_log$"), wmean_ch_log, wmean_ch_500m_lo)
+integration_vars <- ss_data_df %>% select(matches("^wmean_int"))
+
+log_int <- bind_cols(log_choice_vars, integration_vars) %>% na.omit()
+cor_log <- cor(log_int, method = "pearson")
+p_log <- ggcorrplot::cor_pmat(log_int)
+
+ggcorrplot(
+  cor_log,
+  p.mat = p_log,
+  type = "lower",
+  lab = TRUE,
+  sig.level = 0.05,
+  title = "log choice vs integration",
+  hc.order = TRUE
+)
+
+```
+------------------------------------------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------------------------------------------
+SOCIODEMOGRAPHICS
+------------------------------------------------------------------------------------------------------------------------------------
+Census data prep
+```{r}
+# list census raw files to reshape
+data_dir <- "census data/"
+raw_files <- list.files(path = data_dir, pattern = "_RAW\\.csv$", full.names = TRUE)
+
+# helper to reshape a single file into wide indicator form
+load_and_wide_csv <- function(filepath) {
+  message("processing: ", basename(filepath))
+  df <- readr::read_csv(filepath, col_types = cols())
+
+  code_col <- names(df)[1]
+  obs_col  <- names(df)[ncol(df)]
+  df <- df %>% rename(lsoa = !!sym(code_col), obs = !!sym(obs_col))
+
+  cat_cols <- setdiff(names(df), c("lsoa", "obs")) %>% keep(~ is.character(df[[.x]]))
+
+  df_long <- df %>%
+    pivot_longer(cols = all_of(cat_cols), names_to = "variable", values_to = "category") %>%
+    filter(!is.na(category), category != "")
+
+  df_wide <- df_long %>%
+    pivot_wider(
+      id_cols = lsoa,
+      names_from = category,
+      values_from = obs,
+      values_fill = 0,
+      values_fn = sum
+    )
+
+  prefix <- tools::file_path_sans_ext(basename(filepath))
+  df_wide %>% rename_with(.cols = -lsoa, .fn = ~ paste0(prefix, "_", make.names(.)))
+}
+
+# apply to all files
+wide_list <- purrr::map(raw_files, load_and_wide_csv)
+
+# combine all wide tables by lsoa
+final_df <- reduce(wide_list, full_join, by = "lsoa")
+cat("rows:", nrow(final_df), "\n")
+cat("cols:", ncol(final_df) - 1, "\n")
+
+
+```
+
+Join population and deprivation (IMD) data
+```{r}
+# paths to population and imd raw files
+raw_dir <- "census data/population and IMD data/"
+raw_files <- list.files(path = raw_dir, pattern = "_RAW\\.csv$", full.names = TRUE)
+
+# cleaned master with stable lsoa code column
+cleaned <- readr::read_csv(
+  "Census_LSOA_CLEANED.csv",
+  col_types = cols(`Lower layer Super Output Areas Code` = col_character())
+)
+
+# read raws and standardise key name to lsoa
+raw_list <- purrr::map(
+  raw_files,
+  ~ readr::read_csv(.x, col_types = cols(`Lower layer Super Output Areas Code` = col_character())) %>%
+    rename(lsoa = `Lower layer Super Output Areas Code`)
+)
+
+# join cleaned and all raw tables on lsoa
+all_dfs <- c(list(cleaned), raw_list)
+final_df <- reduce(all_dfs, left_join, by = "lsoa")
+
+# read Greater London lsoas and project to ESPG:27700
+gl_shp <- st_read("Greater_London _LSOAs/Greater_London _LSOAs.shp") %>% st_transform(27700)
+london_lsoas <- gl_shp$lsoa21cd
+
+# keep rows that match London lsoas only
+final_df_gl <- final_df %>% filter(lsoa %in% london_lsoas)
+
+# save merged demographics base for later steps
+readr::write_csv(final_df_gl, file.path(SAVED_DIR, "demographics_LSOA_FULL_merged_GL.csv"))
+
+
+```
+
+Clean
+```{r}
+demog <- final_df_gl
+
+# clean names for consistent handling
+demog <- demog %>% janitor::clean_names()
+demog <- demog %>%
+  rename_with(~ str_replace_all(., "[\\.\\s]+", "_")) %>%
+  rename_with(~ str_to_lower(.))
+
+# inspect missing values
+miss_var_summary(demog)
+```
+Impute income score by borough mean
+```{r}
+# attach borough codes and impute income score by borough mean
+gl_codes <- gl_shp %>%
+  st_drop_geometry() %>%
+  transmute(lsoa = lsoa21cd, borough = lad22cd)
+
+demog2 <- demog %>% left_join(gl_codes, by = "lsoa")
+
+borough_means <- demog2 %>%
+  group_by(borough) %>%
+  summarise(borough_imd = mean(income_score_rate, na.rm = TRUE), .groups = "drop")
+
+demog3 <- demog2 %>%
+  left_join(borough_means, by = "borough") %>%
+  mutate(income_score_imputed = coalesce(income_score_rate, borough_imd)) %>%
+  select(-borough_imd)
+
+sum(is.na(demog3$income_score_imputed))  # confirm no missing remain after imputation
+
+
+```
+
+Operationalise sociodemographic variables 
+```{r}
+
+demographics <- demog3 %>%
+  mutate(
+    pct_age_under_16 = aged_15_years_and_under   / resident_population_count * 100,
+    pct_age_16_24    = aged_16_to_24_years       / resident_population_count * 100,
+    pct_age_25_34    = aged_25_to_34_years       / resident_population_count * 100,
+    pct_age_35_49    = aged_35_to_49_years       / resident_population_count * 100,
+    pct_age_50_64    = aged_50_to_64_years       / resident_population_count * 100,
+    pct_age_65_plus  = aged_65_years_and_over    / resident_population_count * 100,
+
+    pct_born_uk      = born_in_the_uk            / resident_population_count * 100,
+    pct_born_nonuk   = born_outside_the_uk       / resident_population_count * 100,
+
+    pct_same_address = address_one_year_ago_is_the_same / resident_population_count * 100,
+
+    pct_female = female / resident_population_count * 100,
+    pct_male   = male   / resident_population_count * 100,
+
+    pct_unemployed       = unemployed / economically_active_total * 100,
+    pct_over30_no_qual   = over_30_no_qualifications / aged_30_years_and_over * 100,
+
+    pct_detached         = detached / number_of_households * 100,
+    pct_semi_detached    = semi_detached / number_of_households * 100,
+    pct_terraced         = terraced / number_of_households * 100,
+    pct_apartment        = maisonette_or_apartment / number_of_households * 100,
+    pct_caravan          = caravan_or_other_mobile_or_temporary_structure / number_of_households * 100,
+    pct_1plus_vehicles   = x1_or_more_cars_or_vans_in_household / number_of_households * 100,
+    pct_lone_parent      = lone_parent_household / number_of_households * 100,
+    pct_owns             = owns_total / number_of_households * 100,
+    pct_social_rented    = social_rented_total / number_of_households * 100,
+
+    pct_income_deprivation = income_score_imputed * 100,
+
+    p_asian = asian_asian_british_or_asian_welsh / resident_population_count,
+    p_black = black_black_british_black_welsh_caribbean_or_african / resident_population_count,
+    p_mixed = mixed_or_multiple_ethnic_groups / resident_population_count,
+    p_white = white / resident_population_count,
+    p_other = other_ethnic_group / resident_population_count,
+
+    herfindahl = p_asian^2 + p_black^2 + p_mixed^2 + p_white^2 + p_other^2,
+    ethnic_heterogeneity = 1 - herfindahl
+  )
+
+# retain only id and variables created for modelling
+demographics <- demographics %>%
+  select(lsoa, starts_with("pct_"), ethnic_heterogeneity)
+
+
+```
+
+PCA - concentrated disadvantage
+```{r}
+# assemble pca inputs
+pca_data <- demographics %>%
+  select(
+    pct_income_deprivation,
+    pct_unemployed,
+    pct_over30_no_qual,
+    pct_social_rented,
+    pct_lone_parent
+  ) %>%
+  drop_na()
+
+# compute correlation matrix and Kaiser Meyer Olkin statistic
+R <- cor(pca_data, use = "pairwise.complete.obs")
+kmo_results <- psych::KMO(R)
+print(kmo_results)
+
+#Bartlett test of sphericity
+n_obs <- nrow(pca_data)
+bartlett_results <- psych::cortest.bartlett(R, n = n_obs)
+print(bartlett_results)
+
+
+```
+```{r}
+# rename inputs for compact diagnostics
+pca_data1 <- demographics %>%
+  transmute(
+    inc_dep   = pct_income_deprivation,
+    unemp     = pct_unemployed,
+    low_qual  = pct_over30_no_qual,
+    soc_rent  = pct_social_rented,
+    lonepar   = pct_lone_parent
+  ) %>%
+  drop_na()
+
+# quick description and correlation chart
+describe(pca_data1)
+PerformanceAnalytics::chart.Correlation(pca_data1, histogram = TRUE, pch = 19)
+
+# pca with centering and scaling
+pca1 <- prcomp(pca_data1, center = TRUE, scale. = TRUE)
+
+# eigenvalues and scree plot to visualise explained variance
+eigval1 <- factoextra::get_eigenvalue(pca1)
+print(eigval1)
+factoextra::fviz_eig(pca1, addlabels = TRUE, ylim = c(0, 80))
+
+```
+```{r}
+# attach pc1 scores back to lsoa
+demographics <- demographics %>%
+  mutate(concentrated_disadvantage = pca1$x[, 1])
+
+```
+
+Correlations 
+```{r}
+# choose control variables for correlation checks and modelling
+vars <- demographics %>%
+  select(
+    ethnic_heterogeneity,
+    concentrated_disadvantage,
+    pct_owns, 
+    pct_same_address,
+    pct_male,
+    pct_born_nonuk,
+    pct_age_16_24,
+    pct_1plus_vehicles
+  )
+
+# correlation matrix with p-values
+corr_res <- Hmisc::rcorr(as.matrix(vars), type = "pearson")
+print(round(corr_res$r, 2))
+print(round(corr_res$P, 3))
+
+# visual correlation diagnostics
+PerformanceAnalytics::chart.Correlation(
+  vars,
+  histogram = TRUE,
+  pch = 19,
+  main = "correlation matrix: demographic controls"
+)
+```
+
+Save  
+```{r}
+# save short controls set
+short <- demographics %>%
+  select(
+    lsoa,
+    ethnic_heterogeneity,
+    concentrated_disadvantage,
+    pct_owns, 
+    pct_same_address,
+    pct_male,
+    pct_born_nonuk,
+    pct_age_16_24,
+    pct_1plus_vehicles
+  )
+readr::write_csv(short, file.path(SAVED_DIR, "demographics_LSOA_SHORT.csv"))
+
+```
+
+
+------------------------------------------------------------------------------------------------------------------------------------
+Land Use
+------------------------------------------------------------------------------------------------------------------------------------
+Aggregate land use categories to LSOA
+```{r}
+# import land use attributes
+land_data_raw <- readr::read_csv("LandUse_LSOA_gl.csv")
+
+# clean names
+land_data <- land_data_raw %>% janitor::clean_names()
+
+# aggregate the selected categories and keep only selected
+land_data <- land_data %>%
+  mutate(
+    residential = residential_total + residential_gardens_total,
+    retail = retail,
+    transport = transport_other,
+    industrial = industry,
+    office = offices,
+    vacant = vacant_total,
+    community_service = community_service_total
+  ) %>%
+  select(lsoa_code, residential, retail, transport, industrial, office, vacant, community_service)
+
+land_data[is.na(land_data)] <- 0
+```
+
+Herfindahl index
+```{r}
+# total across selected categories for normalisation
+land_data <- land_data %>%
+  mutate(selected_total = rowSums(across(residential:community_service), na.rm = TRUE))
+
+# convert to within-selected proportions
+land_use_props <- land_data %>%
+  mutate(across(residential:community_service, ~ .x / selected_total))
+
+# quick check of row sums and non-developed cases
+land_use_props <- land_use_props %>%
+  mutate(row_sum = rowSums(across(residential:community_service), na.rm = TRUE))
+
+# mixed land use index based on 1 − herfindahl; zero where no selected land exists
+land_use_props <- land_use_props %>%
+  mutate(mixed_land_use_index = if_else(
+    selected_total > 0,
+    1 - rowSums(across(residential:community_service, ~ .^2)),
+    0
+  ))
+
+# join back to lsoa geometry 
+lsoa_boundaries <- st_read("Greater_London _LSOAs")
+land_use_gpkg <- lsoa_boundaries %>% 
+  left_join(
+    land_use_props %>%
+      select(lsoa_code, residential:community_service, mixed_land_use_index),
+    by = c("lsoa21cd" = "lsoa_code")
+  )
+
+```
+
+Save
+```{r}
+land_use_csv <- land_use_props %>%
+  select(lsoa_code, residential:community_service, mixed_land_use_index)
+readr::write_csv(land_use_csv, file.path(SAVED_DIR, "land_use_with_mixed_index.csv"))
+
+```
+
+
+------------------------------------------------------------------------------------------------------------------------------------
+LandScan - Ambient Population
+------------------------------------------------------------------------------------------------------------------------------------
+Ambient population density per lsoa
+```{r}
+# load landscan raster
+landscan <- terra::rast("landscan-global-2023.tif")
+
+# load lsoa boundaries and project as needed
+lsoa_boundaries <- st_read("Greater_London _LSOAs") %>% st_transform(27700)
+lsoa_boundaries_wgs84 <- st_transform(lsoa_boundaries, crs(landscan))
+
+# crop raster to london extent to reduce processing time
+landscan_cropped <- terra::crop(landscan, terra::vect(lsoa_boundaries_wgs84))
+
+# plot checks 
+plot(landscan_cropped, main = "landscan - greater london")
+plot(st_geometry(lsoa_boundaries_wgs84), add = TRUE, border = "red", lwd = 0.5)
+
+# area-weighted ambient population per lsoa
+lsoa_boundaries$ambient_population <- exactextractr::exact_extract(
+  landscan_cropped, lsoa_boundaries, fun = "sum", weights = "area"
+)
+
+# count of intersecting raster cells (unweighted)
+lsoa_boundaries$grid_cell_count <- exactextractr::exact_extract(
+  landscan_cropped, lsoa_boundaries,
+  fun = function(values, coverage_fractions) sum(coverage_fractions > 0)
+)
+
+# area in square meters and square kilometers
+lsoa_boundaries$area_sqm  <- st_area(lsoa_boundaries) |> set_units("m^2") |> drop_units()
+lsoa_boundaries$area_sqkm <- lsoa_boundaries$area_sqm / 1e6
+
+# ambient population density per km^2
+lsoa_boundaries$ambient_pop_density_per_sqkm <- lsoa_boundaries$ambient_population / lsoa_boundaries$area_sqkm
+
+```
+
+Save
+```{r}
+# export summary table
+lsoa_summary <- lsoa_boundaries %>%
+  st_drop_geometry() %>%
+  select(lsoa21cd, ambient_population, grid_cell_count, area_sqkm, ambient_pop_density_per_sqkm)
+readr::write_csv(lsoa_summary, file.path(SAVED_DIR, "lsoa_ambient_population.csv"))
+
+```
+
+
+------------------------------------------------------------------------------------------------------------------------------------
+Join All Data
+------------------------------------------------------------------------------------------------------------------------------------
+All prepared datasets plus dependent variables datasets are combined into a single analysis table using the lsoa code as the key
+```{r}
+# define file paths for all inputs to combine
+files <- list(
+  TOV = "OF_LSOA_greater_london_22_24.csv",
+  TFV = "FROM_LSOA_greater_london_22_24.csv",
+  demographics_short = "saved data/demographics_LSOA_SHORT.csv",
+  mixed_land_use     = "saved data/land_use_with_mixed_index.csv",
+  ambient_pop        = "saved data/lsoa_ambient_population.csv",
+  syntax_measures    = "saved data/lsoa_space_syntax_measures.csv",
+  res_pop_dens       = "resident_pop_density_RAW.csv",
+  work_pop_dens      = "workday_pop_density_RAW.csv",
+  POI                = "POI_LSOA_Density.csv"  # "saved data/POI_LSOA_Density.csv" if used code above to aggregate to LSOAs from point data
+)  
+
+# read each dataset with explicit column types for keys
+TOV <- readr::read_csv(files$TOV, col_types = cols(lsoa21cd = col_character(), .default = col_double()))
+TFV <- readr::read_csv(files$TFV, col_types = cols(lsoa21cd = col_character(), lad22nm = col_character(), .default = col_double()))
+demog_short <- readr::read_csv(files$demographics_short, col_types = cols(lsoa = col_character(), .default = col_double()))
+lu <- readr::read_csv(files$mixed_land_use, col_types = cols(
+  lsoa_code             = col_character(),
+  residential           = col_double(),
+  retail                = col_double(),
+  transport             = col_double(),
+  industrial            = col_double(),
+  office                = col_double(),
+  vacant                = col_double(),
+  community             = col_double(),
+  mixed_land_use_index  = col_double()
+))
+ambient <- readr::read_csv(files$ambient_pop, col_types = cols(lsoa21cd = col_character(), .default = col_double()))
+syntax <- readr::read_csv(files$syntax_measures, col_types = cols(lsoa21cd = col_character(), .default = col_double()))
+res_pop_dens <- readr::read_csv(files$res_pop_dens, col_types = cols(lsoa21cd = col_character(), resident_pop_density = col_double()))
+work_pop_dens <- readr::read_csv(files$work_pop_dens, col_types = cols(lsoa21cd = col_character(), workday_pop_density = col_double()))
+POI <- readr::read_csv(files$POI, col_types = cols(lsoa21cd = col_character(), .default = col_double()))
+
+# left join everything to transfer volumes table to keep its row set
+combined <- TFV %>%
+  left_join(TOV,           by = "lsoa21cd") %>%
+  left_join(demog_short,   by = c("lsoa21cd" = "lsoa")) %>%
+  left_join(lu,            by = c("lsoa21cd" = "lsoa_code")) %>%
+  left_join(ambient,       by = "lsoa21cd") %>%
+  left_join(syntax,        by = "lsoa21cd") %>%
+  left_join(res_pop_dens,  by = "lsoa21cd") %>%
+  left_join(work_pop_dens, by = "lsoa21cd") %>%
+  left_join(POI,           by = "lsoa21cd")
+
+```
+
+Save
+```{r}
+# save combined dataset
+readr::write_csv(combined, file.path(SAVED_DIR, "combined_FULL.csv"))
+
+```
+

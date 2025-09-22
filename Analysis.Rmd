@@ -1,0 +1,1739 @@
+---
+title: "Analysis"
+output: html_document
+---
+
+Clear global environment 
+```{r}
+rm(list=ls())
+```
+
+Packages 
+```{r}
+options(stringsAsFactors = FALSE)
+suppressPackageStartupMessages({
+  library(dplyr)               # data manipulation
+  library(tidyr)               # reshaping and missing handling
+  library(purrr)               # functional helpers
+  library(tibble)              # tidy tables
+  library(stringr)             # string utilities
+  library(readr)               # fast csv io
+  library(sf)                  # vector geodata
+  library(spdep)               # spatial dependence tools
+  library(Matrix)              # sparse matrices
+  library(AER)                 # poisson dispersion test
+  library(spaMM)               # poisson–car car ml fits
+  library(car)                 # vif for multicollinearity
+  library(mgcv)                # gam diagnostics
+  library(gt)                  # html tables
+  library(openxlsx)            # excel output
+  library(ggplot2)             # plotting
+})
+
+```
+
+Load data and create output folder 
+```{r}
+# inputs, ids, and output folder kept consistent
+dat <- readr::read_csv("full data/combined_FULL.csv")
+#Or if picking up from 'Predictors Operationalisation' code, where full data was produced and saved in 'saved data' folder:
+#dat <- readr::read_csv("saved data/combined_FULL.csv")
+
+shp <- sf::st_read("Greater_London _LSOAs/Greater_London _LSOAs.shp") |>
+  dplyr::select(lsoa21cd, geometry)
+
+dat$lsoa21cd <- toupper(trimws(dat$lsoa21cd))
+shp$lsoa21cd <- toupper(trimws(shp$lsoa21cd))
+
+OUT_DIR <- "results"
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+```
+
+Scale/transform predictors for modelling:
+```{r}
+# natural log for population densities; standardised z where needed for interaction or quadratic terms)
+dat <- dat |>
+  mutate(
+    log_resident_pop_density         = log(pmax(resident_pop_density, 1e-9)),         # ln
+    log_ambient_pop_density_per_sqkm = log(pmax(ambient_pop_density_per_sqkm, 1e-9)), # ln
+
+    z_log_res  = as.numeric(scale(log_resident_pop_density)),
+    z_mixI     = as.numeric(scale(mixed_land_use_index)),
+
+    z_chG  = as.numeric(scale(wmean_ch_log)),     # global choice (already ln upstream)
+    z_chL  = as.numeric(scale(wmean_ch_1k_log)),  # local  choice (already ln upstream)
+    z_intG = as.numeric(scale(wmean_int)),        # global integration (raw)
+    z_intL = as.numeric(scale(wmean_int_1k)),     # local  integration (raw)
+    
+     # quadratic term of z log residential density
+    z_log_res2 = z_log_res^2,
+    z_cd       = as.numeric(scale(concentrated_disadvantage))
+  )
+
+
+```
+
+GAM diagnostics to assess whether residential and ambient population densities need non-linear terms
+```{r}
+# the predictor set used when building the diagnostic frames
+# the two log density variables are treated with smooth functions s(); others enter linearly
+sa_predictors <- c(
+  "ethnic_heterogeneity","concentrated_disadvantage","pct_same_address","pct_male",
+  "pct_born_nonuk","pct_age_16_24","mixed_land_use_index",
+  "log_resident_pop_density","log_ambient_pop_density_per_sqkm",   # these two will be smoothed
+  "log_adult_entertainment_density_per_km2","log_education_density_per_km2",
+  "log_parking_density_per_km2","log_recreational_density_per_km2",
+  "log_sports_other_entertainment_density_per_km2","log_transport_stations_density_per_km2",
+  "log_accommodation_density_per_km2","log_major_retail_hubs_density_per_km2",
+  "log_off_premise_alcohol_outlets_density_per_km2","log_eating_drinking_density_per_km2",
+  "wmean_connectivity","wmean_ch_1k_log","wmean_int_1k","wmean_ch_log","wmean_int"
+)
+
+# helper building a modelling frame for outcome y with complete cases only
+sa_mk_df <- function(y){
+  need <- c("lsoa21cd", y, sa_predictors)                       # identify required columns
+  dat %>% dplyr::select(all_of(need)) %>% tidyr::drop_na()       # keep complete rows only
+}
+
+# build the linear right-hand side by excluding the two variables that will be smoothed
+sa_rhs_linear <- paste(
+  setdiff(sa_predictors, c("log_resident_pop_density","log_ambient_pop_density_per_sqkm")),
+  collapse = " + "
+)
+
+# fit a gam with poisson log link where both log densities are smoothed with thin plate splines
+# k controls the maximum wiggliness; method = "REML" estimates smoothness objectively
+sa_fit_gam <- function(df, y, k = 6){
+  f <- as.formula(paste0(
+    y, " ~ s(log_resident_pop_density, k=", k, ") + ",
+    "s(log_ambient_pop_density_per_sqkm, k=", k, ") + ",
+    sa_rhs_linear
+  ))
+  mgcv::gam(f, family = poisson(link = "log"), data = df, method = "REML")
+}
+
+# draw a smooth as irr with confidence shading; trans = exp puts log link back on multiplicative scale
+sa_plot_pretty <- function(g, select, main, xlab){
+  graphics::plot(
+    g, select = select, shade = TRUE, shade.col = "grey85", rug = TRUE,
+    seWithMean = TRUE, trans = exp, lwd = 2,
+    main = main, xlab = xlab, ylab = "IRR (relative to mean)"
+  )
+  abline(h = 1, lty = 2)   # reference line for no effect
+}
+
+# create complete-case frames for each outcome
+sa_df_tfv <- sa_mk_df("tfv_count")
+sa_df_tov <- sa_mk_df("tov_count")
+
+# fit the two diagnostic gams
+sa_g_tfv <- sa_fit_gam(sa_df_tfv, "tfv_count", k = 6)
+sa_g_tov <- sa_fit_gam(sa_df_tov, "tov_count", k = 6)
+
+# save a 2×2 figure with both outcomes and both smoothed predictors
+sa_dir <- file.path(OUT_DIR, "nonlinearity_diagnostics")
+dir.create(sa_dir, showWarnings = FALSE, recursive = TRUE)
+
+png(file.path(sa_dir, "res_ambient_log_smooths_pretty.png"),
+    width = 2000, height = 1400, res = 200)
+op <- par(mfrow = c(2,2), mar = c(4.2, 5, 2.4, 1.2), mgp = c(2.2, 0.7, 0))
+
+# natural log of residential density smooth for tfv
+sa_plot_pretty(sa_g_tfv, 1, "TFV: residential population density (ln)", "ln residential population density")
+# natural log of ambient density smooth for tfv
+sa_plot_pretty(sa_g_tfv, 2, "TFV: ambient population density (ln)",      "ln ambient population density")
+# natural log of residential density smooth for tov
+sa_plot_pretty(sa_g_tov, 1, "TOV: residential population density (ln)",  "ln residential population density")
+# natural log of ambient density smooth for tov
+sa_plot_pretty(sa_g_tov, 2, "TOV: ambient population density (ln)",      "ln ambient population density")
+
+par(op); dev.off()
+
+# console summaries give edf and p values to judge nonlinearity
+cat("\n=== gam smooth edf summary (tfv) ===\n")
+tfv_s_table <- summary(sa_g_tfv)$s.table
+tfv_cols <- intersect(colnames(tfv_s_table), c("edf","Ref.df","F","Chi.sq","p-value","p.value"))
+print(tfv_s_table[, tfv_cols, drop = FALSE])
+
+cat("\n=== gam smooth edf summary (tov) ===\n")
+tov_s_table <- summary(sa_g_tov)$s.table
+tov_cols <- intersect(colnames(tov_s_table), c("edf","Ref.df","F","Chi.sq","p-value","p.value"))
+print(tov_s_table[, tov_cols, drop = FALSE])
+
+
+```
+
+Define predictor sets for the models
+```{r}
+# control variables used across models
+controls <- c(
+  "ethnic_heterogeneity","pct_same_address","pct_male","pct_born_nonuk","pct_age_16_24",
+  "log_ambient_pop_density_per_sqkm",
+  "log_adult_entertainment_density_per_km2","log_education_density_per_km2",
+  "log_parking_density_per_km2","log_recreational_density_per_km2",
+  "log_sports_other_entertainment_density_per_km2","log_transport_stations_density_per_km2",
+  "log_accommodation_density_per_km2","log_major_retail_hubs_density_per_km2",
+  "log_off_premise_alcohol_outlets_density_per_km2","log_eating_drinking_density_per_km2",
+  "wmean_connectivity"
+)
+
+# z-standardised predictors for density and space syntax plus concentrated disadvantage
+base_z <- c("z_log_res","z_mixI","z_chL","z_intL","z_chG","z_intG","z_cd")
+
+# collect all columns needed to prepare samples, including quadratic term
+all_needed <- unique(c("lsoa21cd","tfv_count","tov_count", controls, base_z, "z_log_res2"))
+
+```
+
+Outcome prep
+```{r}
+# prepare analysis objects for a given outcome name in dat
+prep_for_outcome <- function(y) {
+  # keep rows with complete data over the required variables for this outcome
+  df0 <- dat |>
+    dplyr::select(any_of(all_needed)) |>
+    tidyr::drop_na(all_of(c("lsoa21cd", y, controls, base_z)))
+
+  # join df0 onto geometry to get a sample-aligned sf
+  sf1 <- shp |> inner_join(df0, by = "lsoa21cd")
+
+  # queen contiguity neighbours
+  nb  <- spdep::poly2nb(sf1, queen = TRUE, row.names = sf1$lsoa21cd)
+
+  # connect isolates to their single nearest neighbour to avoid zero-degree nodes in the graph
+  if (any(spdep::card(nb) == 0)) {
+    ctr <- sf::st_coordinates(sf::st_centroid(sf1))
+    nb_nn <- spdep::knn2nb(spdep::knearneigh(ctr, k = 1))
+    for (i in which(spdep::card(nb) == 0)) nb[[i]] <- nb_nn[[i]]
+  }
+
+  # row-standardised spatial weights for tests, and binary adjacency for CAR
+  lw  <- spdep::nb2listw(nb, style = "W", zero.policy = TRUE)
+  adj <- Matrix::Matrix(spdep::nb2mat(nb, style = "B", zero.policy = TRUE), sparse = TRUE)
+  dimnames(adj) <- list(sf1$lsoa21cd, sf1$lsoa21cd)
+
+  # analysis data without geometry and with area factor to index adjacency(1|area)
+  df <- sf::st_drop_geometry(sf1) |> mutate(area = factor(lsoa21cd))
+  list(df = df, lw = lw, adj = adj, y = y)
+}
+
+# prepare both outcomes
+P_TFV <- prep_for_outcome("tfv_count")
+P_TOV <- prep_for_outcome("tov_count")
+
+
+```
+
+Formulas for spatial Poisson CAR model fits
+```{r}
+# spatial formula with CAR random effect
+form_M1 <- function(y) as.formula(
+  paste0(y, " ~ ", paste(c(controls, base_z), collapse = " + "),
+         " + adjacency(1|area)")
+)
+
+# add quadratic residential density term on z scale
+form_M2 <- function(y) update(form_M1(y), . ~ . + z_log_res2)
+
+# add interactions among theory-motivated pairs
+form_M3 <- function(y) update(form_M2(y), . ~ . + z_mixI:z_cd + z_chG:z_chL + z_intG:z_intL)
+
+
+```
+
+Define model diagnostics 
+```{r}
+
+# fit a Poisson CAR maximum likelihood model using spaMM with adjacency matrix
+fit_spatial <- function(form, df, adj) {
+  spaMM::fitme(form, data = df, family = poisson(), adjMatrix = adj, method = "ML",
+               control = list(maxit = 250))
+}
+
+# compute aic using fixed-effect parameters
+AIC_fixed <- function(m){
+  ll <- tryCatch(as.numeric(logLik(m)), error = function(e) NA_real_)
+  k  <- tryCatch(length(spaMM::fixef(m)),  error = function(e) NA_integer_)
+  if (is.na(ll) || is.na(k)) return(NA_real_)
+  -2*ll + 2*k
+}
+
+# compute bic using fixed-effect parameters
+BIC_fixed <- function(m){
+  ll <- tryCatch(as.numeric(logLik(m)), error = function(e) NA_real_)
+  k  <- tryCatch(length(spaMM::fixef(m)),  error = function(e) NA_integer_)
+  n  <- tryCatch(stats::nobs(m),          error = function(e) NA_integer_)
+  if (is.na(ll) || is.na(k) || is.na(n)) return(NA_real_)
+  -2*ll + log(n)*k
+}
+
+# Pearson dispersion ratio > 1 suggests overdispersion relative to poisson
+dispersion_ratio <- function(m){
+  r <- tryCatch(residuals(m, type="pearson"), error = function(e) NULL)
+  df <- tryCatch(df.residual(m), error = function(e) NA_integer_)
+  if (is.null(r) || is.na(df) || df <= 0) return(NA_real_)
+  sum(r^2)/df
+}
+
+# Moran's I on Pearson residuals checks for remaining spatial autocorrelation
+resid_moran <- function(m, lw){
+  r <- residuals(m, type = "pearson")
+  mi <- spdep::moran.test(r, lw, zero.policy = TRUE)
+  c(I = unname(mi$estimate[["Moran I statistic"]]),
+    p  = as.numeric(mi$p.value))
+}
+
+```
+
+Helpers for output table building
+```{r}
+# tidy IRR for spaMM fits, removes intercept
+tidy_irr_spamm <- function(model){
+  bt <- as.data.frame(summary(model)$beta_table)
+  est <- bt[["Estimate"]]                                    
+  se  <- bt[[grep("SE|Std", names(bt), value = TRUE)[1]]]    # standard error on log scale
+  pcol<- grep("(^p$|p[-_ ]?value|Pr\\(>|Pr\\.)", names(bt), value = TRUE, ignore.case = TRUE)[1]
+  p   <- if (!is.na(pcol)) suppressWarnings(as.numeric(bt[[pcol]])) else {
+    zcol <- grep("(t|z|Wald).*value|Wald", names(bt), value = TRUE, ignore.case = TRUE)[1]
+    2*pnorm(-abs(bt[[zcol]]))
+  }
+  tibble(
+    term    = rownames(bt),
+    IRR     = exp(est),                         # irr = exp(beta)
+    CI_low  = exp(est - 1.96*se),               # lower 95% irr
+    CI_high = exp(est + 1.96*se),               # upper 95% irr
+    stars   = cut(p, c(-Inf,.001,.01,.05,.1,Inf), labels=c("***","**","*",".",""), right=FALSE)
+  ) |> filter(term != "(Intercept)")
+}
+
+# tidy IRR for base glm fits
+tidy_irr_glm <- function(model){
+  s  <- summary(model)
+  co <- coef(s)
+  est <- co[, "Estimate"]                       # natural log coefficient
+  se  <- co[, "Std. Error"]                     # standard error on log scale
+  p   <- co[, "Pr(>|z|)"]
+  tibble(
+    term    = rownames(co),
+    IRR     = exp(est),
+    CI_low  = exp(est - 1.96*se),
+    CI_high = exp(est + 1.96*se),
+    stars   = cut(p, c(-Inf,.001,.01,.05,.1,Inf), labels=c("***","**","*",".",""), right=FALSE)
+  ) |> filter(term != "(Intercept)")
+}
+
+# formatter used when building pretty tables
+fmt_irr <- function(IRR, lo, hi, stars)
+  paste0(sprintf("%.3f", IRR), " [", sprintf("%.3f", lo), ", ", sprintf("%.3f", hi), "]",
+         ifelse(is.na(stars),"",as.character(stars)))
+
+
+```
+
+Predictor labels 
+```{r}
+# readable labels for output tables
+pretty_labels <- c(
+  ethnic_heterogeneity = "Ethnic heterogeneity",
+  z_cd = "Concentrated disadvantage (z)",
+  pct_same_address = "Same address 1-year ago (%)",
+  pct_male = "Male (%)",
+  pct_born_nonuk = "Born outside UK (%)",
+  pct_age_16_24 = "Aged 16–24 (%)",
+
+  log_adult_entertainment_density_per_km2 = "Adult entertainment density (log)",
+  log_education_density_per_km2           = "Education density (log)",
+  log_parking_density_per_km2             = "Parking density (log)",
+  log_recreational_density_per_km2        = "Recreational density (log)",
+  log_sports_other_entertainment_density_per_km2 = "Sports/other entertainment density (log)",
+  log_transport_stations_density_per_km2  = "Transport stations density (log)",
+  log_accommodation_density_per_km2       = "Accommodation density (log)",
+  log_major_retail_hubs_density_per_km2   = "Major retail hubs density (log)",
+  log_off_premise_alcohol_outlets_density_per_km2 = "Off-premise alcohol density (log)",
+  log_eating_drinking_density_per_km2     = "Eating/drinking density (log)",
+
+  log_ambient_pop_density_per_sqkm = "Ambient population density (log)",
+  z_log_res  = "Residential population density (log, z)",
+  z_log_res2 = "Residential population density (log, z)²",
+  z_mixI     = "Mixed land-use index (z)",
+  wmean_connectivity  = "Connectivity",
+  z_chG      = "Global choice (log, z)",
+  z_chL      = "Local choice (log, z)",
+  z_intG     = "Global integration (z)",
+  z_intL     = "Local integration (z)",
+
+  `z_mixI:z_cd`   = "Mixed land-use × Concentrated disadvantage (z×z)",
+  `z_chG:z_chL`   = "Global × Local choice (z×z)",
+  `z_intG:z_intL` = "Global × Local integration (z×z)"
+)
+
+```
+
+Function to fit non-spatial Poisson models
+```{r}
+# fit a non-spatial poisson glm and compute diagnostics
+fit_nonspatial <- function(P, print = TRUE, nsim_moran = 999){
+  # build the fixed-effects formula without spatial random effect
+  form0 <- as.formula(paste0(P$y, " ~ ", paste(c(controls, base_z), collapse = " + ")))
+  d  <- P$df
+
+  # poisson log-link glm
+  g0 <- glm(form0, data = d, family = poisson(link = "log"))
+
+  # diagnostics for overdispersion and spatial autocorrelation in residuals
+  dispR <- sum(residuals(g0, type = "pearson")^2) / df.residual(g0)   # pearson dispersion
+  dispT <- tryCatch(AER::dispersiontest(g0, alternative = "greater"),
+                    error = function(e) NULL)                          # formal test if available
+  rP      <- residuals(g0, type = "pearson")                           # residuals for moran's i
+  mi_asym <- spdep::moran.test(rP, P$lw, zero.policy = TRUE)           # asymptotic p value
+  mi_perm <- spdep::moran.mc(rP, P$lw, nsim = nsim_moran, zero.policy = TRUE)  # permutation p value
+
+  if (isTRUE(print)) {
+    cat("\n================ ", P$y, " — non-spatial poisson ================\n", sep = "")
+    cat("AIC:", sprintf("%.2f", AIC(g0)),
+        "  BIC:", sprintf("%.2f", BIC(g0)),
+        "  logLik:", sprintf("%.2f", as.numeric(logLik(g0))), "\n")
+    cat("Pearson dispersion:", sprintf("%.3f", dispR),
+        "  AER p(overdispersion):", if (is.null(dispT)) "NA" else signif(dispT$p.value, 3), "\n")
+    cat("Moran's I on Pearson residuals:",
+        "I =", round(unname(mi_asym$estimate[["Moran I statistic"]]), 4),
+        "  p(asym) =", signif(mi_asym$p.value, 3),
+        "  p(perm) =", signif(mi_perm$p.value, 3), "\n")
+  }
+
+  list(
+    model   = g0,
+    AIC     = AIC(g0),
+    BIC     = BIC(g0),
+    logLik  = as.numeric(logLik(g0)),
+    dispR   = dispR,
+    disp_p  = if (is.null(dispT)) NA_real_ else as.numeric(dispT$p.value),
+    moran_I = unname(mi_asym$estimate[["Moran I statistic"]]),
+    moran_p_asym = as.numeric(mi_asym$p.value),
+    moran_p_perm = as.numeric(mi_perm$p.value)
+  )
+}
+
+
+```
+
+Function to fit spatial Poisson CAR models
+```{r}
+# fit spatial models 1–3 and collect model doagnistics 
+fit_selected_spatial <- function(P){
+  forms <- list(
+    `Model 1` = form_M1(P$y),
+    `Model 2` = form_M2(P$y),
+    `Model 3` = form_M3(P$y)
+  )
+  fits <- purrr::map(forms, ~ fit_spatial(.x, P$df, P$adj))
+
+  info <- purrr::imap_dfr(fits, function(m, nm){
+    mi <- resid_moran(m, P$lw)   # residual moran's i and p
+    tibble(model = nm,
+           AIC_fixed = AIC_fixed(m) |> round(2),
+           BIC_fixed = BIC_fixed(m) |> round(2),
+           logLik    = as.numeric(logLik(m)) |> round(2),
+           dispR     = dispersion_ratio(m) |> round(3),
+           moran_I   = as.numeric(mi["I"]),
+           moran_p   = as.numeric(mi["p"]))
+  })
+
+  list(fits = fits, info = info)
+}
+
+```
+
+Function for VIF
+```{r}
+# compute VIF using model 1 predictors, non-spatial glm 
+vif_model1 <- function(P){
+  rhs <- paste(c(controls, base_z), collapse = " + ")
+  f_glm <- as.formula(paste0(P$y, " ~ ", rhs))
+  g <- glm(f_glm, family = poisson(), data = P$df)
+  v <- car::vif(g)
+  if (is.matrix(v)) {
+    tibble(variable = rownames(v),
+           GVIF = v[, "GVIF"],
+           Df   = v[, "Df"],
+           GVIF_adj = v[, "GVIF"]^(1/(2*v[, "Df"])))
+  } else {
+    tibble(variable = names(v), VIF = as.numeric(v))
+  }
+}
+
+
+```
+
+Run non-spatial and spatial models for both outcomes (takes awhile)
+```{r}
+# run all fits for both outcomes
+NS_TFV <- fit_nonspatial(P_TFV, print = TRUE)
+NS_TOV <- fit_nonspatial(P_TOV, print = TRUE)
+
+SP_TFV <- fit_selected_spatial(P_TFV)
+SP_TOV <- fit_selected_spatial(P_TOV)
+
+VIF_TFV_M1 <- vif_model1(P_TFV)
+VIF_TOV_M1 <- vif_model1(P_TOV)
+
+
+```
+
+Build and save output tables
+```{r}
+# helper to convert a tidy IRR table into a single labelled column for merging
+as_col <- function(tbl, colname){
+  tbl |>
+    mutate(label = dplyr::recode(term, !!!pretty_labels, .default = term),
+           value = fmt_irr(IRR, CI_low, CI_high, stars)) |>
+    dplyr::select(label, value) |>
+    distinct() |>
+    rename(!!colname := value)
+}
+
+# assemble a four-column coefficient table and add a metrics panel at the bottom
+build_pub_table_4cols <- function(outcome_tag, NS, SP_list){
+  col_NS <- tidy_irr_glm(NS$model)                    |> as_col("Non-spatial")
+  col_M1 <- tidy_irr_spamm(SP_list$fits[["Model 1"]]) |> as_col("Model 1")
+  col_M2 <- tidy_irr_spamm(SP_list$fits[["Model 2"]]) |> as_col("Model 2")
+  col_M3 <- tidy_irr_spamm(SP_list$fits[["Model 3"]]) |> as_col("Model 3")
+
+  cols <- list(col_NS, col_M1, col_M2, col_M3)
+  all_labels <- cols |> purrr::map("label") |> purrr::reduce(union)
+
+  tab <- tibble(label = all_labels) |>
+    left_join(col_NS, by = "label") |>
+    left_join(col_M1, by = "label") |>
+    left_join(col_M2, by = "label") |>
+    left_join(col_M3, by = "label")
+
+  # create a model-level metrics mini table for the bottom rows
+  info_ns <- tibble(
+    model = "Non-spatial",
+    AIC_fixed = NS$AIC, BIC_fixed = NS$BIC, logLik = NS$logLik,
+    dispR = NS$dispR, moran_I = NS$moran_I, moran_p = NS$moran_p_asym
+  )
+  info_sp <- SP_list$info
+  info <- bind_rows(info_ns, info_sp)
+
+  metrics <- tribble(
+    ~label, ~`Non-spatial`, ~`Model 1`, ~`Model 2`, ~`Model 3`,
+    "AIC (fixed-effects)",
+      sprintf("%.2f", info$AIC_fixed[info$model=="Non-spatial"]),
+      sprintf("%.2f", info$AIC_fixed[info$model=="Model 1"]),
+      sprintf("%.2f", info$AIC_fixed[info$model=="Model 2"]),
+      sprintf("%.2f", info$AIC_fixed[info$model=="Model 3"]),
+    "BIC (fixed-effects)",
+      sprintf("%.2f", info$BIC_fixed[info$model=="Non-spatial"]),
+      sprintf("%.2f", info$BIC_fixed[info$model=="Model 1"]),
+      sprintf("%.2f", info$BIC_fixed[info$model=="Model 2"]),
+      sprintf("%.2f", info$BIC_fixed[info$model=="Model 3"]),
+    "Log-likelihood",
+      sprintf("%.2f", info$logLik[info$model=="Non-spatial"]),
+      sprintf("%.2f", info$logLik[info$model=="Model 1"]),
+      sprintf("%.2f", info$logLik[info$model=="Model 2"]),
+      sprintf("%.2f", info$logLik[info$model=="Model 3"]),
+    "Pearson dispersion",
+      sprintf("%.3f", info$dispR[info$model=="Non-spatial"]),
+      sprintf("%.3f", info$dispR[info$model=="Model 1"]),
+      sprintf("%.3f", info$dispR[info$model=="Model 2"]),
+      sprintf("%.3f", info$dispR[info$model=="Model 3"]),
+    "Moran I (p-value)",
+      sprintf("%.3f (%.3g)", info$moran_I[info$model=="Non-spatial"], info$moran_p[info$model=="Non-spatial"]),
+      sprintf("%.3f (%.3g)", info$moran_I[info$model=="Model 1"], info$moran_p[info$model=="Model 1"]),
+      sprintf("%.3f (%.3g)", info$moran_I[info$model=="Model 2"], info$moran_p[info$model=="Model 2"]),
+      sprintf("%.3f (%.3g)", info$moran_I[info$model=="Model 3"], info$moran_p[info$model=="Model 3"])
+  )
+
+  out <- bind_rows(tab, metrics)
+  readr::write_csv(out, file.path(OUT_DIR, paste0(outcome_tag, "_publication_table_m0_m1_m2_m3.csv")))
+  out
+}
+
+# build and save tables for both outcomes
+TFV_table <- build_pub_table_4cols("TFV", NS_TFV, SP_TFV)
+TOV_table <- build_pub_table_4cols("TOV", NS_TOV, SP_TOV)
+
+# save html previews and xlsx workbook copies
+TFV_table |> gt() |> gtsave(filename = file.path(OUT_DIR, "TFV_table_m0_m1_m2_m3.html"))
+TOV_table |> gt() |> gtsave(filename = file.path(OUT_DIR, "TOV_table_m0_m1_m2_m3.html"))
+
+wb <- openxlsx::createWorkbook()
+openxlsx::addWorksheet(wb, "TFV"); openxlsx::writeData(wb, "TFV", TFV_table)
+openxlsx::addWorksheet(wb, "TOV"); openxlsx::writeData(wb, "TOV", TOV_table)
+openxlsx::saveWorkbook(wb, file.path(OUT_DIR, "tables_m0_m1_m2_m3.xlsx"), overwrite = TRUE)
+
+# save vif tables for model 1 samples
+readr::write_csv(VIF_TFV_M1, file.path(OUT_DIR, "VIF_Model1_TFV.csv"))
+readr::write_csv(VIF_TOV_M1, file.path(OUT_DIR, "VIF_Model1_TOV.csv"))
+
+# quick console prints to verify content
+cat("\n=== vif — model 1 (tfv sample) ===\n"); print(VIF_TFV_M1, n = nrow(VIF_TFV_M1))
+cat("\n=== vif — model 1 (tov sample) ===\n"); print(VIF_TOV_M1, n = nrow(VIF_TOV_M1))
+cat("\n=== tfv publication table (m0/m1/m2/m3) ===\n"); print(TFV_table, n = nrow(TFV_table), width = Inf)
+cat("\n=== tov publication table (m0/m1/m2/m3) ===\n"); print(TOV_table, n = nrow(TOV_table), width = Inf)
+cat("\nall outputs saved under:", normalizePath(OUT_DIR), "\n")
+
+
+```
+
+POI doubling and first venue effects tables
+```{r}
+# helper - pretty labels already defined 
+recode_labels <- function(x){
+  if (exists("pretty_labels")) dplyr::recode(x, !!!pretty_labels, .default = x) else x
+}
+
+# list of POI predictors in models (all are ln(x+1))
+poi_terms <- c(
+  "log_adult_entertainment_density_per_km2",
+  "log_education_density_per_km2",
+  "log_parking_density_per_km2",
+  "log_recreational_density_per_km2",
+  "log_sports_other_entertainment_density_per_km2",
+  "log_transport_stations_density_per_km2",
+  "log_accommodation_density_per_km2",
+  "log_major_retail_hubs_density_per_km2",
+  "log_off_premise_alcohol_outlets_density_per_km2",
+  "log_eating_drinking_density_per_km2"
+)
+
+# format IRR effects into % strings for a given delta on the ln(x+1) scale
+effect_str <- function(IRR, lo, hi, stars, delta){
+  pct <- (IRR^delta   - 1) * 100
+  lci <- (lo ^delta   - 1) * 100
+  uci <- (hi ^delta   - 1) * 100
+  paste0(sprintf("%.2f", pct), " [", sprintf("%.2f", lci), ", ", sprintf("%.2f", uci), "]",
+         ifelse(is.na(stars), "", as.character(stars)))
+}
+
+# build a clean POI effects table for MODEL 3 for a given outcome
+make_poi_effect_table <- function(SP_list, df_sample, outcome_tag){
+  stopifnot("Model 3" %in% names(SP_list$fits))
+
+  # coefficients from Model 3
+  coef_tbl <- tidy_irr_spamm(SP_list$fits[["Model 3"]]) %>%
+    filter(term %in% poi_terms) %>%
+    mutate(label_pub = recode_labels(term)) %>%
+    dplyr::select(term, label_pub, IRR, CI_low, CI_high, stars)
+
+  # medians on the RAW scale per POI for the actual modelling sample
+  # df_sample columns are ln(x+1); invert to get raw x
+  med_tbl <- tibble(term = poi_terms) %>%
+    mutate(
+      label_pub       = recode_labels(term),
+      raw_all         = map_dbl(term, ~ median(exp(df_sample[[.x]]) - 1, na.rm = TRUE)),
+      raw_pos_median  = map_dbl(term, ~ {
+        x <- exp(df_sample[[.x]]) - 1
+        xp <- x[x > 0]
+        if (length(xp)) median(xp, na.rm = TRUE) else NA_real_
+      })
+    )
+
+  # deltas on ln(x+1) scale
+  # first venue: 0 -> 1  -> ln(2)
+  delta_first <- log(2)
+
+  # doubling at positive median (if available): x -> 2x  -> ln((2x+1)/(x+1))
+  med_pos <- med_tbl$raw_pos_median
+  delta_doubling <- ifelse(is.finite(med_pos) & med_pos > 0,
+                           log((2*med_pos + 1) / (med_pos + 1)),
+                           NA_real_)
+
+  med_tbl <- med_tbl %>% mutate(delta_first = delta_first,
+                                delta_double = delta_doubling)
+
+  # join and compute both effects for every POI
+  out <- coef_tbl %>%
+    left_join(med_tbl, by = c("term","label_pub")) %>%
+    mutate(
+      `Doubling M3 (%)`   = ifelse(is.na(delta_double),
+                                   "",
+                                   effect_str(IRR, CI_low, CI_high, stars, delta_double)),
+      `First venue M3 (%)`= effect_str(IRR, CI_low, CI_high, stars, delta_first)
+    ) %>%
+    transmute(
+      label_pub,
+      median_raw_all  = raw_all,
+      median_raw_pos  = raw_pos_median,
+      `Doubling M3 (%)`,
+      `First venue M3 (%)`
+    )
+
+  # order rows nicely
+  out <- out %>% arrange(match(label_pub, recode_labels(poi_terms)))
+
+  # save and print
+  fn <- file.path(OUT_DIR, paste0("POI_effects_M3_", outcome_tag, ".csv"))
+  readr::write_csv(out, fn)
+  cat("\nSaved:", fn, "\n")
+  out
+}
+```
+```{r}
+# run for both outcomes 
+POI_TFV_M3 <- make_poi_effect_table(SP_TFV, P_TFV$df, "TFV")
+POI_TOV_M3 <- make_poi_effect_table(SP_TOV, P_TOV$df, "TOV")
+
+# show 
+cat("\n=== POI EFFECTS — Model 3, TFV ===\n")
+print(POI_TFV_M3, n = nrow(POI_TFV_M3), width = Inf)
+
+cat("\n=== POI EFFECTS — Model 3, TOV ===\n")
+print(POI_TOV_M3, n = nrow(POI_TOV_M3), width = Inf)
+
+```
+
+Likelihood Ratio tests
+```{r}
+# create a subfolder to keep lrt outputs together
+lrt_dir <- file.path(OUT_DIR, "lrt")
+dir.create(lrt_dir, showWarnings = FALSE, recursive = TRUE)
+
+# helper to compare a smaller model to a larger model
+lrt_pair <- function(m_small, m_big, label){
+  # extract log-likelihoods; suppress warnings if spaMM reports non-standard attributes
+  ll1 <- suppressWarnings(as.numeric(logLik(m_small)))   # loglik of smaller model
+  ll2 <- suppressWarnings(as.numeric(logLik(m_big)))     # loglik of larger model
+
+  # count the number of fixed-effect coefficients in each model
+  k1  <- suppressWarnings(length(spaMM::fixef(m_small)))
+  k2  <- suppressWarnings(length(spaMM::fixef(m_big)))
+
+  # compute degrees of freedom as the added fixed effects
+  df  <- k2 - k1
+
+  # compute the likelihood-ratio statistic
+  stat <- 2 * (ll2 - ll1)
+
+  # compute the p-value if df is positive and values are finite
+  p    <- if (is.finite(stat) && is.finite(df) && df > 0) pchisq(stat, df = df, lower.tail = FALSE) else NA_real_
+
+  # return a one-row data frame with a readable label
+  data.frame(comparison = label, Chisq = stat, df = df, p_value = p, check.names = FALSE)
+}
+
+# helper to run the three standard comparisons for a given list of fitted models
+ lrt_all <- function(SP){
+  # pull models 1 to 3 from the list returned earlier by fit_selected_spatial
+  m1 <- SP$fits[["Model 1"]]
+  m2 <- SP$fits[["Model 2"]]
+  m3 <- SP$fits[["Model 3"]]
+
+  # bind the three comparisons into a single table
+  rbind(
+     lrt_pair(m1, m2, "Model 2 vs Model 1"),
+     lrt_pair(m2, m3, "Model 3 vs Model 2"),
+     lrt_pair(m1, m3, "Model 3 vs Model 1")
+  )
+}
+
+# run the lrts for both outcomes using the already fitted spatial models
+LRT_TFV <- lrt_all(SP_TFV)
+LRT_TOV <- lrt_all(SP_TOV)
+
+# save
+readr::write_csv(LRT_TFV, file.path(lrt_dir, "LRT_TFV_M1_M2_M3.csv"))
+readr::write_csv(LRT_TOV, file.path(lrt_dir, "LRT_TOV_M1_M2_M3.csv"))
+
+# print to console 
+cat("\n=== lrt — tfv (m1–m3) ===\n"); print(LRT_TFV, row.names = FALSE)
+cat("\n=== lrt — tov (m1–m3) ===\n"); print(LRT_TOV, row.names = FALSE)
+```
+
+
+--------------------------------------------------------------------------------------------------------------------------
+DESCRIPTIVE STATISTICS 
+--------------------------------------------------------------------------------------------------------------------------
+Tables
+```{r}
+# create a folder for descriptive outputs
+DESC_DIR <- file.path(OUT_DIR, "descriptives")
+if (!dir.exists(DESC_DIR)) dir.create(DESC_DIR, recursive = TRUE)
+
+# the exact set of covariates used in model 2 (no interactions; includes the quadratic z term in the data but not plotted later)
+m2_vars <- c(
+  "ethnic_heterogeneity","pct_same_address","z_cd",
+  "pct_male","pct_born_nonuk","pct_age_16_24",
+  "z_log_res","z_log_res2","log_ambient_pop_density_per_sqkm",
+  "log_adult_entertainment_density_per_km2","log_education_density_per_km2",
+  "log_parking_density_per_km2","log_recreational_density_per_km2",
+  "log_sports_other_entertainment_density_per_km2",
+  "log_transport_stations_density_per_km2","log_accommodation_density_per_km2",
+  "log_major_retail_hubs_density_per_km2","log_off_premise_alcohol_outlets_density_per_km2",
+  "log_eating_drinking_density_per_km2",
+  "z_mixI","wmean_connectivity","z_chG","z_chL","z_intG","z_intL"
+)
+
+# helper to compute descriptive stats using the modelling sample for a given outcome
+desc_table_model2 <- function(P, outcome, vars, label_map = NULL) {
+  # the modelling keys identify the rows used by the fitted models
+  key <- P$df$lsoa21cd
+
+  # iterate over the outcome and each covariate and compute robust summaries
+  dplyr::bind_rows(purrr::map(c(outcome, vars), function(v) {
+    # pull the variable from the modelling frame if present; otherwise pull it from the full dataset and align to keys
+    have_in_model <- v %in% names(P$df)
+    have_in_dat   <- v %in% names(dat)
+
+    x <- if (have_in_model) {
+      P$df[[v]]
+    } else if (have_in_dat) {
+      dat[[v]][match(key, dat$lsoa21cd)]
+    } else {
+      NULL
+    }
+
+    # if the variable cannot be found, return a row of missing statistics
+    if (is.null(x)) return(tibble::tibble(
+      model_var       = v,
+      label           = if (!is.null(label_map)) dplyr::recode(v, !!!label_map, .default = v) else v,
+      N               = 0L,
+      Minimum         = NA_real_, Maximum = NA_real_,
+      Mean            = NA_real_, Median   = NA_real_,
+      `Std. Deviation`= NA_real_
+    ))
+
+    # coerce to numeric if needed to avoid errors in summary functions
+    if (!is.numeric(x)) x <- suppressWarnings(as.numeric(x))
+
+    # compute standard summary statistics
+    tibble::tibble(
+      model_var       = v,
+      label           = if (!is.null(label_map)) dplyr::recode(v, !!!label_map, .default = v) else v,
+      N               = sum(!is.na(x)),
+      Minimum         = suppressWarnings(min(x, na.rm = TRUE)),
+      Maximum         = suppressWarnings(max(x, na.rm = TRUE)),
+      Mean            = mean(x, na.rm = TRUE),
+      Median          = median(x, na.rm = TRUE),
+      `Std. Deviation`= stats::sd(x, na.rm = TRUE)
+    )
+  })) %>%
+    # round the outputs for tidy presentation
+    dplyr::mutate(
+      Minimum          = round(Minimum, 3),
+      Maximum          = round(Maximum, 3),
+      Mean             = round(Mean, 3),
+      Median           = round(Median, 3),
+      `Std. Deviation` = round(`Std. Deviation`, 3)
+    )
+}
+
+# compute and save tfv summaries for model 2 variables including the dependent variable
+tfv_desc <- desc_table_model2(P_TFV, "tfv_count", m2_vars, label_map = pretty_labels)
+readr::write_csv(tfv_desc, file.path(DESC_DIR, "TFV_descriptives.csv"))
+
+# compute and save tov summaries
+tov_desc <- desc_table_model2(P_TOV, "tov_count", m2_vars, label_map = pretty_labels)
+readr::write_csv(tov_desc, file.path(DESC_DIR, "TOV_descriptives.csv"))
+
+# compute a full descriptive table for every numeric variable in the master dataset for context
+all_numeric <- names(dat)[vapply(dat, is.numeric, logical(1))]
+all_desc <- purrr::map_dfr(all_numeric, function(v){
+  x <- dat[[v]]
+  tibble::tibble(
+    variable         = v,
+    N                = sum(!is.na(x)),
+    Minimum          = suppressWarnings(min(x, na.rm = TRUE)),
+    Maximum          = suppressWarnings(max(x, na.rm = TRUE)),
+    Mean             = mean(x, na.rm = TRUE),
+    Median           = median(x, na.rm = TRUE),
+    `Std. Deviation` = stats::sd(x, na.rm = TRUE)
+  )
+}) %>%
+  dplyr::mutate(
+    Minimum          = round(Minimum, 3),
+    Maximum          = round(Maximum, 3),
+    Mean             = round(Mean, 3),
+    Median           = round(Median, 3),
+    `Std. Deviation` = round(`Std. Deviation`, 3)
+  ) %>%
+  dplyr::arrange(variable)
+
+readr::write_csv(all_desc, file.path(DESC_DIR, "ALL_numeric_in_dat_descriptives.csv"))
+
+cat("saved:\n",
+    file.path(DESC_DIR, "TFV_descriptives.csv"), "\n",
+    file.path(DESC_DIR, "TOV_descriptives.csv"), "\n",
+    file.path(DESC_DIR, "ALL_numeric_in_data_descriptives.csv"), "\n")
+
+```
+
+Predictor plots
+```{r}
+# create a folder for the figures
+FIG_DIR <- file.path(OUT_DIR, "descriptives", "tfv_plots")
+if (!dir.exists(FIG_DIR)) dir.create(FIG_DIR, recursive = TRUE)
+
+# local label override for readability in plots
+local_labels <- pretty_labels
+local_labels["log_ambient_pop_density_per_sqkm"] <- "Ambient population density (log)"
+
+# poi variables
+poi_vars <- c(
+  "log_adult_entertainment_density_per_km2",
+  "log_education_density_per_km2",
+  "log_parking_density_per_km2",
+  "log_recreational_density_per_km2",
+  "log_sports_other_entertainment_density_per_km2",
+  "log_transport_stations_density_per_km2",
+  "log_accommodation_density_per_km2",
+  "log_major_retail_hubs_density_per_km2",
+  "log_off_premise_alcohol_outlets_density_per_km2",
+  "log_eating_drinking_density_per_km2"
+)
+
+# non-poi variables in model 2 excluding the quadratic term from plotting
+other_m2_vars <- c(
+  "ethnic_heterogeneity","pct_same_address","z_cd",
+  "pct_male","pct_born_nonuk","pct_age_16_24",
+  "log_ambient_pop_density_per_sqkm","z_log_res",
+  "z_mixI","wmean_connectivity",
+  "z_chG","z_chL","z_intG","z_intL"
+)
+
+# helper to pull a vector for a variable aligned to the tfv modelling keys
+get_tfv_var <- function(var){
+  key <- P_TFV$df$lsoa21cd
+  out <- if (var %in% names(P_TFV$df)) P_TFV$df[[var]] else dat[[var]][match(key, dat$lsoa21cd)]
+  suppressWarnings(as.numeric(out))
+}
+
+# build a long table for a list of variables
+build_long <- function(vars){
+  purrr::map_dfr(vars, function(v){
+    tibble::tibble(var = v, value = get_tfv_var(v))
+  }) |>
+    dplyr::filter(is.finite(value)) |>
+    dplyr::mutate(label = dplyr::recode(var, !!!local_labels, .default = var))
+}
+
+# histogram and density plot with median line
+plot_facet <- function(df_long, title, ncol = 4, bins = 40){
+  med_df <- df_long |>
+    dplyr::group_by(label) |>
+    dplyr::summarise(med = median(value, na.rm = TRUE), .groups = "drop")
+
+  ggplot2::ggplot(df_long, ggplot2::aes(x = value)) +
+    ggplot2::geom_histogram(ggplot2::aes(y = after_stat(density)), bins = bins,
+                            fill = "grey72", colour = "grey40") +
+    ggplot2::geom_density(linewidth = 0.7) +
+    ggplot2::geom_vline(data = med_df, ggplot2::aes(xintercept = med), linetype = 2, linewidth = 0.5) +
+    ggplot2::facet_wrap(~ label, scales = "free", ncol = ncol) +
+    ggplot2::labs(title = title, x = NULL, y = "density") +
+    ggplot2::theme_bw(base_size = 11)
+}
+
+# make and save the poi panel
+df_poi <- build_long(poi_vars)
+p_poi  <- plot_facet(df_poi, "tfv – poi variables (model 2)", ncol = 4)
+ggplot2::ggsave(file.path(FIG_DIR, "TFV_Model2_POI_distributions.png"),
+       p_poi, width = 14, height = 10, dpi = 300)
+ggplot2::ggsave(file.path(FIG_DIR, "TFV_Model2_POI_distributions.pdf"),
+       p_poi, width = 14, height = 10)
+
+# make and save the non poi panel
+df_other <- build_long(other_m2_vars)
+p_other  <- plot_facet(df_other, "tfv – other model 2 variables", ncol = 4)
+ggplot2::ggsave(file.path(FIG_DIR, "TFV_Model2_other_distributions.png"),
+       p_other, width = 14, height = 10, dpi = 300)
+ggplot2::ggsave(file.path(FIG_DIR, "TFV_Model2_other_distributions.pdf"),
+       p_other, width = 14, height = 10)
+
+
+```
+
+DV plots
+```{r}
+# create a folder for dv plots
+FIG_DIR <- file.path(OUT_DIR, "dv_plots")
+dir.create(FIG_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# plotter that draws a histogram in density units and overlays a kernel density curve
+plot_hist_density <- function(x, title, binwidth, xlim = NULL, file){
+  x <- x[is.finite(x)]                 # keep finite values only
+  mn <- mean(x); md <- median(x)       # mean and median for reference lines
+  df <- tibble::tibble(val = x)
+
+  p <- ggplot2::ggplot(df, ggplot2::aes(val)) +
+    ggplot2::geom_histogram(ggplot2::aes(y = after_stat(density)),
+                   binwidth = binwidth, boundary = 0, closed = "left",
+                   fill = "grey60", colour = "grey40", linewidth = 0.3) +
+    ggplot2::geom_density(linewidth = 0.8, colour = "black", na.rm = TRUE) +
+    ggplot2::geom_vline(xintercept = mn, linetype = "dashed", linewidth = 0.8, colour = "black") +
+    ggplot2::geom_vline(xintercept = md, linetype = "solid",  linewidth = 0.8, colour = "black") +
+    ggplot2::labs(
+      title    = title,
+      subtitle = sprintf("mean = %.2f, median = %.2f, binwidth = %g", mn, md, binwidth),
+      x = "count", y = "density"
+    ) +
+    ggplot2::theme_minimal(base_size = 13) +
+    ggplot2::theme(plot.title.position = "plot", panel.grid.minor = ggplot2::element_blank())
+
+  # restrict the x axis without affecting binning or density
+  if (!is.null(xlim)) p <- p + ggplot2::coord_cartesian(xlim = xlim)
+
+  # save and return the plot
+  ggplot2::ggsave(filename = file, plot = p, width = 10, height = 5.2, dpi = 300)
+  p
+}
+
+# confirm required columns exist
+stopifnot(all(c("tfv_count","tov_count") %in% names(dat)))
+
+# build and save both figures
+p_tfv <- plot_hist_density(
+  x = dat$tfv_count,
+  title = "tfv counts",
+  binwidth = 10,
+  xlim = NULL,
+  file = file.path(FIG_DIR, "TFV_counts_hist_density.png")
+)
+
+p_tov <- plot_hist_density(
+  x = dat$tov_count,
+  title = "tov counts",
+  binwidth = 5,
+  xlim = NULL,
+  file = file.path(FIG_DIR, "TOV_counts_hist_density.png")
+)
+
+# print 
+print(p_tfv); print(p_tov)
+
+cat("\nsaved to:\n  ",
+    file.path(FIG_DIR, "TFV_counts_hist_density.png"), "\n  ",
+    file.path(FIG_DIR, "TOV_counts_hist_density.png"), "\n", sep = "")
+
+
+```
+
+Correlations 
+```{r}
+# based on tfv model 1 
+# p<.05 marked with one star 
+
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+# create a folder for correlation outputs
+STATS_DIR <- file.path(OUT_DIR, "correlations")
+if (!dir.exists(STATS_DIR)) dir.create(STATS_DIR, recursive = TRUE) 
+
+# pretty label recoder that falls back to identity if labels are missing
+recode_pretty <- function(x){
+  if (exists("pretty_labels")) dplyr::recode(x, !!!pretty_labels, .default = x) else x
+}
+
+# starred correlation strings, numeric correlations, pairwise sample sizes
+cor_star_matrix_p05 <- function(df, var_order) {
+  X <- df %>% dplyr::select(all_of(var_order)) %>% dplyr::select(where(is.numeric))
+  vars <- names(X); p <- length(vars)
+  R <- matrix(NA_real_, p, p, dimnames = list(vars, vars))  # correlations
+  N <- matrix(NA_integer_, p, p, dimnames = list(vars, vars))# pair counts
+  S <- matrix("", p, p, dimnames = list(vars, vars))        # stars
+
+  for (i in seq_len(p)) {
+    xi <- X[[i]]
+    for (j in i:p) {
+      xj <- X[[j]]
+      ok <- is.finite(xi) & is.finite(xj) 
+      n  <- sum(ok)
+      N[i, j] <- N[j, i] <- n 
+
+      if (n >= 3) {
+        r <- suppressWarnings(stats::cor(xi[ok], xj[ok]))
+        r <- ifelse(is.finite(r), r, NA_real_)
+        R[i, j] <- R[j, i] <- r
+
+        if (i != j && is.finite(r)) {
+          tval <- r * sqrt((n - 2) / pmax(1e-12, 1 - r^2))
+          pval <- 2 * stats::pt(-abs(tval), df = n - 2)
+          S[i, j] <- S[j, i] <- ifelse(pval < 0.05, "*", "")
+        }
+      } else {
+        R[i, j] <- R[j, i] <- NA_real_
+        S[i, j] <- S[j, i] <- ""
+      }
+
+      if (i == j) {
+        R[i, i] <- 1
+        S[i, i] <- ""
+      }
+    }
+  }
+
+  # apply pretty labels and round to two decimals
+  row_labs <- recode_pretty(rownames(R))
+  col_labs <- recode_pretty(colnames(R))
+  col_labs <- make.unique(col_labs, sep = " ")
+
+  dimnames(R) <- list(row_labs, col_labs)
+  dimnames(N) <- list(row_labs, col_labs)
+  dimnames(S) <- list(row_labs, col_labs)
+
+  R_num_2 <- round(R, 2)
+  R_star  <- matrix(paste0(sprintf("%.2f", R), S),
+                    nrow = nrow(R), dimnames = dimnames(R))
+
+  list(
+    starred = as.data.frame(R_star, stringsAsFactors = FALSE) %>% tibble::rownames_to_column("variable"),
+    numeric = as.data.frame(R_num_2)                           %>% tibble::rownames_to_column("variable"),
+    n_pairs = as.data.frame(N)                                 %>% tibble::rownames_to_column("variable")
+  )
+}
+
+# build the model 1 predictor frame for tfv
+stopifnot(exists("P_TFV"), is.list(P_TFV), "df" %in% names(P_TFV))
+stopifnot(exists("controls"), exists("base_z"))
+
+# include only variables present in the frame 
+m1_vars <- intersect(c(controls, base_z), names(P_TFV$df))
+m1_vars <- setdiff(m1_vars, c("pct_1plus_vehicles", "pct_1plus_vehicle", "households_with_vehicle"))
+
+tfv_m1_df <- P_TFV$df %>% dplyr::select(all_of(m1_vars))
+
+# compute the matrices
+cs_tfv_m1 <- cor_star_matrix_p05(tfv_m1_df, var_order = m1_vars)
+
+# save 
+readr::write_csv(cs_tfv_m1$starred, file.path(STATS_DIR, "TFV_Model1_correlations_STARRED_p05_pretty_2dp.csv"))
+
+# print
+cat("\n=== tfv — model 1 correlations (pretty labels; single star = p<.05; 2 d.p.; no vehicle-ownership) ===\n")
+print(cs_tfv_m1$starred, n = 12, width = Inf) 
+
+
+```
+
+---------------------------------------------------------------------------------------------------------------------------
+Quadratic effect plots for residential density 
+```{r}
+# plotter for a quadratic term on the z scale with exact delta-method confidence intervals
+plot_quadratic_effect <- function(fit,
+                                  term_z,          
+                                  term_z2,         
+                                  z_min = -2, z_max = 2, n = 201,
+                                  xlab   = "residential population density (z)",
+                                  title  = "quadratic effect (irr relative to z = 0)",
+                                  sd_log = NULL,   # sd of ln(original density) for the modelling sample
+                                  filename = NULL) {
+
+  #  pull the linear and quadratic coefficients (in this order): term_z, term_z2
+  cf <- as.numeric(spaMM::fixef(fit)[c(term_z, term_z2)])
+  names(cf) <- c("b1","b2")
+
+  # extract their 2×2 covariance matrix for delta-method standard errors
+  V  <- as.matrix(stats::vcov(fit))[c(term_z, term_z2), c(term_z, term_z2)]
+  if (any(is.na(cf)) || any(is.na(V))) stop("terms not found in model or vcov not available.")
+
+  # evaluate η(z) = b1*z + b2*z^2 and its SE across a grid
+  z   <- seq(z_min, z_max, length.out = n)
+  L   <- cbind(z, z^2)                         # design rows for linear and quadratic terms
+  eta <- as.vector(L %*% cf)                   # fitted change on log scale (relative to z = 0)
+  se  <- sqrt(rowSums((L %*% V) * L))          # delta-method standard errors
+
+  # transform to IRR with 95% CI 
+  df <- tibble::tibble(
+    z   = z,
+    IRR = exp(eta),
+    lo  = exp(eta - 1.96*se),
+    hi  = exp(eta + 1.96*se)
+  )
+
+  # draw the curve with a CI ribbon and a reference line at IRR = 1
+  p <- ggplot2::ggplot(df, ggplot2::aes(z, IRR)) +
+    ggplot2::geom_ribbon(ggplot2::aes(ymin = lo, ymax = hi), alpha = 0.18) +
+    ggplot2::geom_line(linewidth = 1) +
+    ggplot2::geom_hline(yintercept = 1, linetype = 2) +
+    ggplot2::scale_y_continuous("irr (relative to z = 0)") +
+    ggplot2::labs(x = xlab, title = title) +
+    ggplot2::theme_bw(base_size = 12)
+
+  # secondary x-axis mapping to a multiplier of original density (uses natural logs)
+  #    if z = (ln d − mean)/sd, then multiply d by exp(sd_log * z)
+  if (!is.null(sd_log) && is.finite(sd_log)) {
+    brks <- pretty(c(z_min, z_max), n = 5)
+    mult_lab <- function(x) sprintf("×%.2f", exp(sd_log * x))
+    p <- p + ggplot2::scale_x_continuous(
+      xlab,
+      breaks = brks,
+      sec.axis = ggplot2::dup_axis(labels = mult_lab,
+                                   name   = "approx. change in original density")
+    )
+  }
+
+  # save 
+  if (!is.null(filename)) ggplot2::ggsave(filename, p, width = 7.2, height = 4.6, dpi = 300)
+  p
+}
+
+# sample-specific SDs of ln(residential density) (use the same rows as the models)
+get_sample_sd_logres <- function(P_obj, dat) {
+  idx <- match(P_obj$df$lsoa21cd, dat$lsoa21cd)
+  stats::sd(dat$log_resident_pop_density[idx], na.rm = TRUE)
+}
+sd_log_TFV <- get_sample_sd_logres(P_TFV, dat)
+sd_log_TOV <- get_sample_sd_logres(P_TOV, dat)
+
+# output folder for the figures
+out_subdir <- file.path(OUT_DIR, "res_pop_quadratic_effect_plots")
+if (!dir.exists(out_subdir)) dir.create(out_subdir, recursive = TRUE)
+
+# use Model 3 explicitly 
+fit_TFV <- SP_TFV$fits[["Model 3"]]  
+fit_TOV <- SP_TOV$fits[["Model 3"]]  
+stopifnot(!is.null(fit_TFV), !is.null(fit_TOV))
+
+# build and save the plots for both outcomes using the same z range
+p_tfv_quad <- plot_quadratic_effect(
+  fit      = fit_TFV,
+  term_z   = "z_log_res",
+  term_z2  = "z_log_res2",
+  xlab     = "residential population density (z)",
+  title    = "tfv: quadratic effect of residential density",
+  sd_log   = sd_log_TFV,
+  filename = file.path(out_subdir, "TFV_quadratic_residential_density.png")
+)
+
+p_tov_quad <- plot_quadratic_effect(
+  fit      = fit_TOV,
+  term_z   = "z_log_res",
+  term_z2  = "z_log_res2",
+  xlab     = "residential population density (z)",
+  title    = "tov: quadratic effect of residential density",
+  sd_log   = sd_log_TOV,
+  filename = file.path(out_subdir, "TOV_quadratic_residential_density.png")
+)
+
+```
+
+Interaction effects plots
+```{r}
+# function to plot an interaction with IRR and confidence ribbons
+plot_interaction_exact <- function(fit, df, xvar, modvar,
+                                   xlab, modlab, outcome_label,
+                                   filename = NULL,
+                                   at = c(-1,0,1),                      # moderator levels to plot
+                                   x_seq = seq(-1.25, 1.25, length.out = 101),  # x grid on z scale
+                                   hold_fn = function(z) mean(z, na.rm = TRUE), # how to hold other covariates
+                                   ci_alpha = 0.15) {
+
+  # build a prediction grid over x and moderator values and hold all other variables constant
+  make_grid <- function(df, xvar, modvar){
+    grid <- expand.grid(x_seq, at)
+    names(grid) <- c(xvar, modvar)
+    drop_these <- c(xvar, modvar, "tfv_count", "tov_count")
+    others <- setdiff(names(df), drop_these)
+
+    # set numeric controls to their mean and non-numeric to the first observed level
+    for (v in others) grid[[v]] <- if (is.numeric(df[[v]])) hold_fn(df[[v]]) else df[[v]][1]
+
+    # provide a valid placeholder area level for the adjacency term
+    if ("area" %in% names(df)) grid$area <- df$area[1]
+    grid
+  }
+  g <- make_grid(df, xvar, modvar)
+
+  # predict on the link scale
+  pr <- predict(fit, newdata = g, type = "link", re.form = NA,
+                variances = list(predVar = TRUE))
+  g$eta <- as.numeric(pr)
+
+  # extract the prediction variance attribute if present and compute standard errors
+  PV <- attr(pr, "predVar")
+  if (!is.null(PV)) {
+    se <- if (is.matrix(PV)) sqrt(pmax(diag(PV), 0)) else sqrt(pmax(as.numeric(PV),0))
+  } else {
+    se <- rep(NA_real_, nrow(g))
+    message("predict() did not return predVar; plotting without confidence ribbons.")
+  }
+  g$se <- se
+
+  # center curves at x = 0 within each moderator level so irr equals one at the center
+  g <- g %>%
+    dplyr::mutate(.mod = .data[[modvar]], .x = .data[[xvar]]) %>%
+    dplyr::group_by(.mod) %>%
+    dplyr::mutate(
+      idx0 = which.min(abs(.x)),
+      base_eta  = eta[idx0],
+      eta_c     = eta - base_eta,
+      eta_lo_c  = (eta - 1.96*se) - base_eta,
+      eta_hi_c  = (eta + 1.96*se) - base_eta
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(
+      IRR    = exp(eta_c),
+      IRR_lo = exp(eta_lo_c),
+      IRR_hi = exp(eta_hi_c),
+      !!modvar := factor(.data[[modvar]], levels = c(-1,0,1), labels = c("-1","0","1"))
+    )
+
+  # check if the confidence bounds are available
+  have_ci <- all(!is.na(g$IRR_lo))
+
+  # draw the curves and ribbons, one colour per moderator level
+  p <- ggplot2::ggplot(g, ggplot2::aes(x = .data[[xvar]], y = IRR,
+                                       colour = .data[[modvar]], fill = .data[[modvar]])) +
+    { if (have_ci) ggplot2::geom_ribbon(ggplot2::aes(ymin = IRR_lo, ymax = IRR_hi),
+                                        alpha = ci_alpha, colour = NA) else ggplot2::geom_blank() } +
+    ggplot2::geom_line(linewidth = 1) +
+    ggplot2::geom_hline(yintercept = 1, linetype = 2) +
+    ggplot2::scale_colour_manual(values = c("red", "green", "blue"), name = modlab) +
+    ggplot2::scale_fill_manual(values   = c("red", "green", "blue"), name = modlab) +
+    ggplot2::labs(x = xlab, y = "irr (relative to x = 0)", title = outcome_label) +
+    ggplot2::theme_minimal(base_size = 13) +
+    ggplot2::theme(legend.position = "right")
+
+  if (!is.null(filename)) ggplot2::ggsave(filename, p, width = 9, height = 5.2, dpi = 300)
+  p
+}
+
+# create a folder to store the interaction plots
+FIG_DIR <- file.path(OUT_DIR, "interaction_effect_plots")
+dir.create(FIG_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# reuse the fitted models chosen earlier and the modelling frames 
+df_TFV <- P_TFV$df
+df_TOV <- P_TOV$df
+
+# tfv: local × global choice interaction on the z scale
+p_tfv_choice <- plot_interaction_exact(
+  fit = fit_TFV, df = df_TFV,
+  xvar = "z_chL", modvar = "z_chG",
+  xlab = "local choice (log, z)", modlab = "global choice (log, z)",
+  outcome_label = "tfv: local × global choice",
+  filename = file.path(FIG_DIR, "TFV_exact_interaction_choice.png")
+)
+
+# tfv: local × global integration interaction on the z scale
+p_tfv_integ <- plot_interaction_exact(
+  fit = fit_TFV, df = df_TFV,
+  xvar = "z_intL", modvar = "z_intG",
+  xlab = "local integration (z)", modlab = "global integration (z)",
+  outcome_label = "tfv: local × global integration",
+  filename = file.path(FIG_DIR, "TFV_exact_interaction_integration.png")
+)
+
+# tov: local × global choice
+p_tov_choice <- plot_interaction_exact(
+  fit = fit_TOV, df = df_TOV,
+  xvar = "z_chL", modvar = "z_chG",
+  xlab = "local choice (log, z)", modlab = "global choice (log, z)",
+  outcome_label = "tov: local × global choice",
+  filename = file.path(FIG_DIR, "TOV_exact_interaction_choice.png")
+)
+
+# tov: local × global integration
+p_tov_integ <- plot_interaction_exact(
+  fit = fit_TOV, df = df_TOV,
+  xvar = "z_intL", modvar = "z_intG",
+  xlab = "local integration (z)", modlab = "global integration (z)",
+  outcome_label = "tov: local × global integration",
+  filename = file.path(FIG_DIR, "TOV_exact_interaction_integration.png")
+)
+
+# print
+print(p_tfv_choice); print(p_tfv_integ)
+print(p_tov_choice); print(p_tov_integ)
+
+```
+
+
+---------------------------------------------------------------------------------------------------------------------------
+SENSITIVITY ANALYSIS 
+---------------------------------------------------------------------------------------------------------------------------
+Add vehicle ownership to the models 
+```{r}
+# inputs are reused if already in memory; otherwise read from disk
+SA_dat <- if (exists("dat")) dat else readr::read_csv("saved data/combined_FULL.csv")
+SA_shp <- if (exists("shp")) shp else sf::st_read("Greater_London _LSOAs/Greater_London _LSOAs.shp") |> 
+  dplyr::select(lsoa21cd, geometry)
+
+# normalise id codes for safe joins
+SA_dat$lsoa21cd <- toupper(trimws(SA_dat$lsoa21cd))
+SA_shp$lsoa21cd <- toupper(trimws(SA_shp$lsoa21cd))
+
+# create an output folder nested under the main results directory
+SA_OUT_ROOT <- if (exists("OUT_DIR")) OUT_DIR else "results"
+SA_OUT_DIR  <- file.path(SA_OUT_ROOT, "sensitivity_M0_M1_M2_M3_with_vehicle")
+dir.create(SA_OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# confirm derived variables exist, otherwise create them the same way as in the main pipeline
+# logs here are natural logarithms; z_* are standardised to mean zero and unit variance
+needed_vars <- c("log_resident_pop_density","log_ambient_pop_density_per_sqkm",
+                 "z_log_res","z_mixI","z_chG","z_chL","z_intG","z_intL","z_log_res2","z_cd")
+if (!all(needed_vars %in% names(SA_dat))) {
+  SA_dat <- SA_dat %>%
+    dplyr::mutate(
+      log_resident_pop_density         = if (!"log_resident_pop_density" %in% names(.))  log(pmax(resident_pop_density, 1e-9)) else log_resident_pop_density,
+      log_ambient_pop_density_per_sqkm = if (!"log_ambient_pop_density_per_sqkm" %in% names(.)) log(pmax(ambient_pop_density_per_sqkm, 1e-9)) else log_ambient_pop_density_per_sqkm,
+      z_log_res  = if (!"z_log_res" %in% names(.))  as.numeric(scale(log_resident_pop_density)) else z_log_res,
+      z_mixI     = if (!"z_mixI" %in% names(.))     as.numeric(scale(mixed_land_use_index)) else z_mixI,
+      z_chG      = if (!"z_chG" %in% names(.))      as.numeric(scale(wmean_ch_log)) else z_chG,
+      z_chL      = if (!"z_chL" %in% names(.))      as.numeric(scale(wmean_ch_1k_log)) else z_chL,
+      z_intG     = if (!"z_intG" %in% names(.))     as.numeric(scale(wmean_int)) else z_intG,
+      z_intL     = if (!"z_intL" %in% names(.))     as.numeric(scale(wmean_int_1k)) else z_intL,
+      z_log_res2 = if (!"z_log_res2" %in% names(.)) z_log_res^2 else z_log_res2,
+      z_cd       = if (!"z_cd" %in% names(.))       as.numeric(scale(concentrated_disadvantage)) else z_cd
+    )
+}
+
+# predictor sets for the sensitivity models with vehicle ownership included in the controls
+SA_controls <- c(
+  "ethnic_heterogeneity","pct_same_address",
+  "pct_male","pct_born_nonuk","pct_age_16_24",
+  "pct_1plus_vehicles",                       # added control
+  "log_ambient_pop_density_per_sqkm",
+  "log_adult_entertainment_density_per_km2","log_education_density_per_km2",
+  "log_parking_density_per_km2","log_recreational_density_per_km2",
+  "log_sports_other_entertainment_density_per_km2","log_transport_stations_density_per_km2",
+  "log_accommodation_density_per_km2","log_major_retail_hubs_density_per_km2",
+  "log_off_premise_alcohol_outlets_density_per_km2","log_eating_drinking_density_per_km2",
+  "wmean_connectivity"
+)
+SA_base_z <- c("z_log_res","z_mixI","z_chL","z_intL","z_chG","z_intG","z_cd")
+SA_all_needed <- unique(c("lsoa21cd","tfv_count","tov_count", SA_controls, SA_base_z, "z_log_res2"))
+
+# preparation step to match the main pipeline: build the modelling frame, neighbours, listw, and sparse adjacency
+SA_prep_for_outcome <- function(y) {
+  df0 <- SA_dat %>%
+    dplyr::select(any_of(SA_all_needed)) %>%
+    tidyr::drop_na(all_of(c("lsoa21cd", y, SA_controls, SA_base_z)))
+
+  sf1 <- SA_shp %>% dplyr::inner_join(df0, by = "lsoa21cd")
+
+  nb  <- spdep::poly2nb(sf1, queen = TRUE, row.names = sf1$lsoa21cd)
+
+  # connect any isolated areas to their nearest neighbour to ensure a connected graph
+  if (any(spdep::card(nb) == 0)) {
+    ctr <- sf::st_coordinates(sf::st_centroid(sf1))
+    nb_nn <- spdep::knn2nb(spdep::knearneigh(ctr, k = 1))
+    for (i in which(spdep::card(nb) == 0)) nb[[i]] <- nb_nn[[i]]
+  }
+
+  # build row-standardised weights and a binary adjacency matrix
+  lw  <- spdep::nb2listw(nb, style = "W", zero.policy = TRUE)
+  adj <- Matrix::Matrix(spdep::nb2mat(nb, style = "B", zero.policy = TRUE), sparse = TRUE)
+  dimnames(adj) <- list(sf1$lsoa21cd, sf1$lsoa21cd)
+
+  # add an area factor for spaMM adjacency() and drop geometry to form the modelling data frame
+  df <- sf::st_drop_geometry(sf1) %>% dplyr::mutate(area = factor(lsoa21cd))
+
+  list(df = df, lw = lw, adj = adj, y = y)
+}
+SA_P_TFV <- SA_prep_for_outcome("tfv_count")
+SA_P_TOV <- SA_prep_for_outcome("tov_count")
+
+# model formulas for the sensitivity fits
+SA_form_M1 <- function(y) as.formula(
+  paste0(y, " ~ ", paste(c(SA_controls, SA_base_z), collapse = " + "),
+         " + adjacency(1|area)")
+)
+SA_form_M2 <- function(y) update(SA_form_M1(y), . ~ . + z_log_res2)
+SA_form_M3 <- function(y) update(SA_form_M2(y), . ~ . + z_mixI:z_cd + z_chG:z_chL + z_intG:z_intL)
+
+# fitter and small utilities mirrored from the main analysis
+SA_fit_spatial <- function(form, df, adj) {
+  spaMM::fitme(form, data = df, family = poisson(), adjMatrix = adj, method = "ML",
+               control = list(maxit = 250))
+}
+SA_AIC_fixed <- function(m){
+  ll <- tryCatch(as.numeric(logLik(m)), error = function(e) NA_real_)
+  k  <- tryCatch(length(spaMM::fixef(m)),  error = function(e) NA_integer_)
+  if (is.na(ll) || is.na(k)) return(NA_real_)
+  -2*ll + 2*k
+}
+SA_BIC_fixed <- function(m){
+  ll <- tryCatch(as.numeric(logLik(m)), error = function(e) NA_real_)
+  k  <- tryCatch(length(spaMM::fixef(m)),  error = function(e) NA_integer_)
+  n  <- tryCatch(stats::nobs(m),          error = function(e) NA_integer_)
+  if (is.na(ll) || is.na(k) || is.na(n)) return(NA_real_)
+  -2*ll + log(n)*k
+}
+SA_dispersion_ratio <- function(m){
+  r <- tryCatch(residuals(m, type="pearson"), error = function(e) NULL)
+  df <- tryCatch(df.residual(m), error = function(e) NA_integer_)
+  if (is.null(r) || is.na(df) || df <= 0) return(NA_real_)
+  sum(r^2)/df
+}
+SA_resid_moran <- function(m, lw){
+  r <- residuals(m, type = "pearson")
+  mi <- spdep::moran.test(r, lw, zero.policy = TRUE)
+  c(I = unname(mi$estimate[["Moran I statistic"]]),
+    p  = as.numeric(mi$p.value))
+}
+SA_tidy_irr_spamm <- function(model){
+  bt <- as.data.frame(summary(model)$beta_table)
+  est <- bt[["Estimate"]]
+  se  <- bt[[grep("SE|Std", names(bt), value = TRUE)[1]]]
+  pcol<- grep("(^p$|p[-_ ]?value|Pr\\(>|Pr\\.)", names(bt), value = TRUE, ignore.case = TRUE)[1]
+  p   <- if (!is.na(pcol)) suppressWarnings(as.numeric(bt[[pcol]])) else {
+    zcol <- grep("(t|z|Wald).*value|Wald", names(bt), value = TRUE, ignore.case = TRUE)[1]
+    2*pnorm(-abs(bt[[zcol]]))
+  }
+  tibble::tibble(
+    term    = rownames(bt),
+    IRR     = exp(est),
+    CI_low  = exp(est - 1.96*se),
+    CI_high = exp(est + 1.96*se),
+    stars   = cut(p, c(-Inf,.001,.01,.05,.1,Inf), labels=c("***","**","*",".",""), right=FALSE)
+  ) %>% dplyr::filter(term != "(Intercept)")
+}
+SA_tidy_irr_glm <- function(model){
+  s  <- summary(model); co <- coef(s)
+  est <- co[, "Estimate"]; se <- co[, "Std. Error"]; p <- co[, "Pr(>|z|)"]
+  tibble::tibble(
+    term    = rownames(co),
+    IRR     = exp(est),
+    CI_low  = exp(est - 1.96*se),
+    CI_high = exp(est + 1.96*se),
+    stars   = cut(p, c(-Inf,.001,.01,.05,.1,Inf), labels=c("***","**","*",".",""), right=FALSE)
+  ) %>% dplyr::filter(term != "(Intercept)")
+}
+SA_fmt_irr <- function(IRR, lo, hi, stars)
+  paste0(sprintf("%.3f", IRR), " [", sprintf("%.3f", lo), ", ", sprintf("%.3f", hi), "]",
+         ifelse(is.na(stars),"",as.character(stars)))
+
+SA_pretty_labels <- c(
+  ethnic_heterogeneity = "Ethnic heterogeneity",
+  z_cd = "Concentrated disadvantage (z)",
+  pct_same_address = "Same address 1-year ago (%)",
+  pct_male = "Male (%)",
+  pct_born_nonuk = "Born outside UK (%)",
+  pct_age_16_24 = "Aged 16–24 (%)",
+  pct_1plus_vehicles = "Households with ≥1 vehicle (%)",
+  log_adult_entertainment_density_per_km2 = "Adult entertainment density (log)",
+  log_education_density_per_km2           = "Education density (log)",
+  log_parking_density_per_km2             = "Parking density (log)",
+  log_recreational_density_per_km2        = "Recreational density (log)",
+  log_sports_other_entertainment_density_per_km2 = "Sports/other entertainment density (log)",
+  log_transport_stations_density_per_km2  = "Transport stations density (log)",
+  log_accommodation_density_per_km2       = "Accommodation density (log)",
+  log_major_retail_hubs_density_per_km2   = "Major retail hubs density (log)",
+  log_off_premise_alcohol_outlets_density_per_km2 = "Off-premise alcohol density (log)",
+  log_eating_drinking_density_per_km2     = "Eating/drinking density (log)",
+  log_ambient_pop_density_per_sqkm = "Ambient population density (log)",
+  z_log_res  = "Residential population density (log, z)",
+  z_log_res2 = "Residential population density (log, z)²",
+  z_mixI     = "Mixed land-use index (z)",
+  wmean_connectivity  = "Connectivity",
+  z_chG      = "Global choice (log, z)",
+  z_chL      = "Local choice (log, z)",
+  z_intG     = "Global integration (z)",
+  z_intL     = "Local integration (z)",
+  `z_mixI:z_cd`   = "Mixed land-use × concentrated disadvantage (z×z)",
+  `z_chG:z_chL`   = "Global × local choice (z×z)",
+  `z_intG:z_intL` = "Global × local integration (z×z)"
+)
+
+
+```
+```{r}
+# sensitivity non-spatial poisson
+# fits the same fixed-effects structure as model 1 but without spatial random effects
+# includes vehicle ownership. reports a dispersion ratio, a dispersion test p-value, and
+# moran’s i on pearson residuals as a check for remaining spatial autocorrelation.
+
+SA_fit_nonspatial <- function(P, print = TRUE, nsim_moran = 999){
+  form0 <- as.formula(paste0(P$y, " ~ ", paste(c(SA_controls, SA_base_z), collapse = " + ")))
+  d  <- P$df
+
+  # fit the poisson glm with log link
+  g0 <- glm(form0, data = d, family = poisson(link = "log"))
+
+  # compute the pearson dispersion ratio to assess overdispersion
+  dispR <- sum(residuals(g0, type = "pearson")^2) / df.residual(g0)
+
+  # run the aer dispersion test against the alternative of overdispersion
+  dispT <- tryCatch(AER::dispersiontest(g0, alternative = "greater"),
+                    error = function(e) NULL)
+
+  # compute moran’s i on pearson residuals to check for spatial autocorrelation
+  rP      <- residuals(g0, type = "pearson")
+  mi_asym <- spdep::moran.test(rP, P$lw, zero.policy = TRUE)                 # asymptotic p-value
+  mi_perm <- spdep::moran.mc(rP, P$lw, nsim = nsim_moran, zero.policy = TRUE)# permutation p-value
+
+  
+  # return a compact list of results for table building
+  list(
+    model   = g0,
+    AIC     = AIC(g0),
+    BIC     = BIC(g0),
+    logLik  = as.numeric(logLik(g0)),
+    dispR   = dispR,
+    disp_p  = if (is.null(dispT)) NA_real_ else as.numeric(dispT$p.value),
+    moran_I = unname(mi_asym$estimate[["Moran I statistic"]]),
+    moran_p_asym = as.numeric(mi_asym$p.value),
+    moran_p_perm = as.numeric(mi_perm$p.value)
+  )
+}
+
+```
+```{r}
+# spatial models: m1, m2, m3 -----------------------
+# run the three spatial models and collects model-level metrics and moran’s i of residuals
+
+SA_fit_selected_spatial <- function(P){
+  forms <- list(
+    `Model 1` = SA_form_M1(P$y),
+    `Model 2` = SA_form_M2(P$y),
+    `Model 3` = SA_form_M3(P$y)
+  )
+
+  # fit each formula with the shared adjacency structure
+  fits <- purrr::map(forms, ~ SA_fit_spatial(.x, P$df, P$adj))
+
+  # build a compact info table for publication
+  info <- purrr::imap_dfr(fits, function(m, nm){
+    mi <- SA_resid_moran(m, P$lw)
+    tibble::tibble(
+      model     = nm,
+      AIC_fixed = SA_AIC_fixed(m) |> round(2),
+      BIC_fixed = SA_BIC_fixed(m) |> round(2),
+      logLik    = as.numeric(logLik(m)) |> round(2),
+      dispR     = SA_dispersion_ratio(m) |> round(3),
+      moran_I   = as.numeric(mi["I"]),
+      moran_p   = as.numeric(mi["p"])
+    )
+  })
+
+  list(fits = fits, info = info)
+}
+
+# vif for model 1 (fixed-effects) 
+# compute multidisciplinary diagnostics for the fixed-effects set of model 1.
+SA_vif_model1 <- function(P){
+  rhs <- paste(c(SA_controls, SA_base_z), collapse = " + ")
+  f_glm <- as.formula(paste0(P$y, " ~ ", rhs))
+  g <- glm(f_glm, family = poisson(), data = P$df)
+  v <- car::vif(g)
+
+  # vif and gvif 
+  if (is.matrix(v)) {
+    tibble::tibble(variable = rownames(v),
+           GVIF = v[, "GVIF"],
+           Df   = v[, "Df"],
+           GVIF_adj = v[, "GVIF"]^(1/(2*v[, "Df"])))
+  } else {
+    tibble::tibble(variable = names(v), VIF = as.numeric(v))
+  }
+}
+
+
+```
+```{r}
+# run models
+# fit non-spatial and spatial models for both outcomes and compute vifs
+
+SA_NS_TFV <- SA_fit_nonspatial(SA_P_TFV, print = TRUE)
+SA_NS_TOV <- SA_fit_nonspatial(SA_P_TOV, print = TRUE)
+
+SA_SP_TFV <- SA_fit_selected_spatial(SA_P_TFV)
+SA_SP_TOV <- SA_fit_selected_spatial(SA_P_TOV)
+
+SA_VIF_TFV_M1 <- SA_vif_model1(SA_P_TFV)
+SA_VIF_TOV_M1 <- SA_vif_model1(SA_P_TOV)
+
+
+```
+```{r}
+# build sensitivity output tables 
+# this mirrors the main tables but writes into the sensitivity output folder
+
+SA_as_col <- function(tbl, colname){
+  tbl %>%
+    dplyr::mutate(
+      label = dplyr::recode(term, !!!SA_pretty_labels, .default = term),
+      value = SA_fmt_irr(IRR, CI_low, CI_high, stars)
+    ) %>%
+    dplyr::select(label, value) %>%
+    dplyr::distinct() %>%
+    dplyr::rename(!!colname := value)
+}
+
+SA_build_pub_table_4cols <- function(outcome_tag, NS, SP_list){
+  # collect coefficient columns for the four models
+  col_NS <- SA_tidy_irr_glm(NS$model)                    |> SA_as_col("Non-spatial")
+  col_M1 <- SA_tidy_irr_spamm(SP_list$fits[["Model 1"]]) |> SA_as_col("Model 1")
+  col_M2 <- SA_tidy_irr_spamm(SP_list$fits[["Model 2"]]) |> SA_as_col("Model 2")
+  col_M3 <- SA_tidy_irr_spamm(SP_list$fits[["Model 3"]]) |> SA_as_col("Model 3")
+
+  # align on the union of labels to avoid dropped rows
+  cols <- list(col_NS, col_M1, col_M2, col_M3)
+  all_labels <- cols |> purrr::map("label") |> purrr::reduce(union)
+
+  tab <- tibble::tibble(label = all_labels) |>
+    dplyr::left_join(col_NS, by = "label") |>
+    dplyr::left_join(col_M1, by = "label") |>
+    dplyr::left_join(col_M2, by = "label") |>
+    dplyr::left_join(col_M3, by = "label")
+
+  # add diagnostics to the bottom of the table
+  info_ns <- tibble::tibble(
+    model = "Non-spatial",
+    AIC_fixed = NS$AIC, BIC_fixed = NS$BIC, logLik = NS$logLik,
+    dispR = NS$dispR, moran_I = NS$moran_I, moran_p = NS$moran_p_asym
+  )
+  info_sp <- SP_list$info
+  info <- dplyr::bind_rows(info_ns, info_sp)
+
+  metrics <- tibble::tribble(
+    ~label, ~`Non-spatial`, ~`Model 1`, ~`Model 2`, ~`Model 3`,
+    "AIC (fixed-effects)",
+      sprintf("%.2f", info$AIC_fixed[info$model=="Non-spatial"]),
+      sprintf("%.2f", info$AIC_fixed[info$model=="Model 1"]),
+      sprintf("%.2f", info$AIC_fixed[info$model=="Model 2"]),
+      sprintf("%.2f", info$AIC_fixed[info$model=="Model 3"]),
+    "BIC (fixed-effects)",
+      sprintf("%.2f", info$BIC_fixed[info$model=="Non-spatial"]),
+      sprintf("%.2f", info$BIC_fixed[info$model=="Model 1"]),
+      sprintf("%.2f", info$BIC_fixed[info$model=="Model 2"]),
+      sprintf("%.2f", info$BIC_fixed[info$model=="Model 3"]),
+    "Log-likelihood",
+      sprintf("%.2f", info$logLik[info$model=="Non-spatial"]),
+      sprintf("%.2f", info$logLik[info$model=="Model 1"]),
+      sprintf("%.2f", info$logLik[info$model=="Model 2"]),
+      sprintf("%.2f", info$logLik[info$model=="Model 3"]),
+    "Pearson dispersion",
+      sprintf("%.3f", info$dispR[info$model=="Non-spatial"]),
+      sprintf("%.3f", info$dispR[info$model=="Model 1"]),
+      sprintf("%.3f", info$dispR[info$model=="Model 2"]),
+      sprintf("%.3f", info$dispR[info$model=="Model 3"]),
+    "Moran I (p-value)",
+      sprintf("%.3f (%.3g)", info$moran_I[info$model=="Non-spatial"], info$moran_p[info$model=="Non-spatial"]),
+      sprintf("%.3f (%.3g)", info$moran_I[info$model=="Model 1"], info$moran_p[info$model=="Model 1"]),
+      sprintf("%.3f (%.3g)", info$moran_I[info$model=="Model 2"], info$moran_p[info$model=="Model 2"]),
+      sprintf("%.3f (%.3g)", info$moran_I[info$model=="Model 3"], info$moran_p[info$model=="Model 3"])
+  )
+
+  out <- dplyr::bind_rows(tab, metrics)
+
+  # save to csv 
+  readr::write_csv(out, file.path(SA_OUT_DIR, paste0(outcome_tag, "_publication_table_m0_m1_m2_m3_with_vehicle.csv")))
+  out
+}
+
+# build and save the sensitivity tables for both outcomes
+SA_TFV_table <- SA_build_pub_table_4cols("TFV", SA_NS_TFV, SA_SP_TFV)
+SA_TOV_table <- SA_build_pub_table_4cols("TOV", SA_NS_TOV, SA_SP_TOV)
+
+
+```
+```{r}
+# write vif outputs for model 1 (with vehicle ownership) to csv
+# these files allow later inspection or reporting
+readr::write_csv(SA_VIF_TFV_M1, file.path(SA_OUT_DIR, "VIF_Model1_TFV_with_vehicle.csv"))
+readr::write_csv(SA_VIF_TOV_M1, file.path(SA_OUT_DIR, "VIF_Model1_TOV_with_vehicle.csv"))
+
+# 4) print vif tables 
+cat("\n=== VIF — Model 1 with vehicle ownership (TFV sample) ===\n")
+print(SA_VIF_TFV_M1, n = nrow(SA_VIF_TFV_M1))
+
+cat("\n=== VIF — Model 1 with vehicle ownership (TOV sample) ===\n")
+print(SA_VIF_TOV_M1, n = nrow(SA_VIF_TOV_M1))
+
+```
+
+
+
